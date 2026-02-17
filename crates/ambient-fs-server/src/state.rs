@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use ambient_fs_watcher::FsWatcher;
 use crate::agents::AgentTracker;
+use crate::llm::LlmClient;
 use crate::subscriptions::SubscriptionManager;
 use crate::tree_state::ProjectTree;
 
@@ -28,6 +29,8 @@ pub struct ServerState {
     pub machine_id: String,
     /// Agent activity tracker
     pub agent_tracker: AgentTracker,
+    /// LLM client - Some if AMBIENT_FS_LLM_MODEL is set, None if disabled
+    pub llm: Option<Arc<LlmClient>>,
 }
 
 impl ServerState {
@@ -44,6 +47,7 @@ impl ServerState {
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".to_string()),
             agent_tracker: AgentTracker::with_default_timeout(),
+            llm: LlmClient::from_env().map(Arc::new),
         }
     }
 
@@ -57,6 +61,7 @@ impl ServerState {
             trees: Arc::new(RwLock::new(HashMap::new())),
             machine_id,
             agent_tracker: AgentTracker::with_default_timeout(),
+            llm: LlmClient::from_env().map(Arc::new),
         }
     }
 

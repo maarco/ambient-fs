@@ -76,7 +76,33 @@ ambient-fsd events --limit 50
 ambient-fsd awareness <project-id> <path>
 ```
 
-Shows file awareness state (last modified, TODOs, etc.).
+Shows file awareness state (last modified, source, TODOs, etc.).
+
+## AI Agent Source Detection
+
+To attribute filesystem events to an AI agent, inject activity via the socket while the daemon is running:
+
+```bash
+NOW=$(date +%s)
+SOCK=/tmp/ambient-fs.sock
+
+# Signal that agent is editing a file
+printf '{"jsonrpc":"2.0","method":"report_agent_activity","params":{
+  "ts":%d,"agent":"claude-code","action":"edit",
+  "file":"/path/to/file.rs","tool":"claude-code"},"id":1}\n' "$NOW" \
+  | nc -U "$SOCK"
+
+# ... agent edits file, events stored with source=ai_agent ...
+
+# Signal agent is done
+printf '{"jsonrpc":"2.0","method":"report_agent_activity","params":{
+  "ts":%d,"agent":"claude-code","action":"edit",
+  "file":"/path/to/file.rs","done":true},"id":2}\n' \
+  "$(date +%s)" | nc -U "$SOCK"
+
+# Query to verify
+ambient-fsd events --source ai_agent --limit 10
+```
 
 ## Config
 

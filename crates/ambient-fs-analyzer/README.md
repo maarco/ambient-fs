@@ -144,7 +144,7 @@ let parsed = llm.parse_response(&response)?;
 
 ## Testing
 
-60 tests covering:
+69 tests covering:
 - Line counting (empty files, various line endings)
 - TODO detection (multiple comment styles, case-insensitive)
 - Language detection (extensions, overrides)

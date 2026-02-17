@@ -205,6 +205,7 @@ pub enum Method {
     QueryAgents,
     QueryTree,
     Attribute,
+    ReportAgentActivity,
 }
 
 impl Method {
@@ -221,6 +222,7 @@ impl Method {
             Self::QueryAgents => "query_agents",
             Self::QueryTree => "query_tree",
             Self::Attribute => "attribute",
+            Self::ReportAgentActivity => "report_agent_activity",
         }
     }
 }
@@ -247,6 +249,7 @@ impl std::str::FromStr for Method {
             "query_agents" => Ok(Self::QueryAgents),
             "query_tree" => Ok(Self::QueryTree),
             "attribute" => Ok(Self::Attribute),
+            "report_agent_activity" => Ok(Self::ReportAgentActivity),
             _ => Err(MethodParseError(s.to_string())),
         }
     }

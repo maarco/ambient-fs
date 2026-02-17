@@ -1,7 +1,7 @@
 // Analysis pipeline - bridges watcher events to cached analysis
 // TDD: Tests FIRST, then implementation
 
-use ambient_fs_analyzer::{AnalyzerConfig, FileAnalyzer};
+use ambient_fs_analyzer::{AnalyzerConfig, FileAnalyzer, LlmFileAnalyzer, LanguageRegistry};
 use ambient_fs_core::analysis::FileAnalysis;
 use ambient_fs_core::event::{FileEvent, EventType};
 use ambient_fs_store::FileAnalysisCache;
@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+use crate::llm::LlmClient;
 use crate::state::ServerState;
 
 /// Pipeline configuration
@@ -33,6 +34,7 @@ impl Default for PipelineConfig {
 /// - Receives FileEvents from watcher
 /// - Checks cache freshness (by content_hash)
 /// - Runs tier 1 analysis if stale (line count, TODOs)
+/// - Runs tier 2 analysis if LLM enabled (imports, exports, lint hints)
 /// - Caches results
 /// - Spawns tasks non-blocking via schedule_analysis
 pub struct AnalysisPipeline {
@@ -42,6 +44,8 @@ pub struct AnalysisPipeline {
     semaphore: Arc<Semaphore>,
     config: PipelineConfig,
     state: Option<Arc<ServerState>>,
+    /// LLM client for tier 2 analysis - None if disabled
+    llm: Option<Arc<LlmClient>>,
 }
 
 impl AnalysisPipeline {
@@ -58,12 +62,19 @@ impl AnalysisPipeline {
             semaphore,
             config,
             state: None,
+            llm: None,
         }
     }
 
     /// Set the server state for broadcasting analysis notifications
     pub fn with_state(mut self, state: Arc<ServerState>) -> Self {
         self.state = Some(state);
+        self
+    }
+
+    /// Set the LLM client for tier 2 analysis
+    pub fn with_llm(mut self, llm: Arc<LlmClient>) -> Self {
+        self.llm = Some(llm);
         self
     }
 
@@ -165,7 +176,49 @@ impl AnalysisPipeline {
 
     /// Internal analyze with error handling
     async fn do_analyze(&self, event: FileEvent, project_root: std::path::PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(analysis) = self.analyze_file(&event, &project_root).await {
+        if let Some(mut analysis) = self.analyze_file(&event, &project_root).await {
+            // Tier 2: LLM analysis (imports, exports, lint hints)
+            if let Some(ref llm) = self.llm {
+                let file_path = project_root.join(&event.file_path);
+                if let Some(lang) = LanguageRegistry::get_for_path(&file_path) {
+                    match tokio::fs::read_to_string(&file_path).await {
+                        Ok(content) => {
+                            let llm_analyzer = LlmFileAnalyzer::new(true);
+                            let (system, user) = llm_analyzer.build_prompt(
+                                &event.file_path,
+                                &content,
+                                lang.name,
+                            );
+                            match llm.call(&system, &user).await {
+                                Ok(response) => {
+                                    match llm_analyzer.enhance_with_llm_response(analysis.clone(), &response) {
+                                        Ok(enhanced) => {
+                                            analysis = enhanced;
+                                            debug!("tier 2 complete: {} imports={} exports={}",
+                                                event.file_path,
+                                                analysis.imports.len(),
+                                                analysis.exports.len());
+
+                                            // Update cache with enhanced analysis
+                                            let store_path = self.store_path.clone();
+                                            let enhanced_clone = analysis.clone();
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                let cache = FileAnalysisCache::open(store_path)
+                                                    .or_else(|_| FileAnalysisCache::in_memory())?;
+                                                cache.put(&enhanced_clone)
+                                            }).await;
+                                        }
+                                        Err(e) => warn!("tier 2 parse failed for {}: {}", event.file_path, e),
+                                    }
+                                }
+                                Err(e) => warn!("tier 2 LLM call failed for {}: {}", event.file_path, e),
+                            }
+                        }
+                        Err(e) => warn!("tier 2 read failed for {}: {}", event.file_path, e),
+                    }
+                }
+            }
+
             debug!("analysis complete: {} {} lines={} todos={}",
                 event.project_id, event.file_path, analysis.line_count, analysis.todo_count);
 
@@ -190,6 +243,7 @@ impl AnalysisPipeline {
             semaphore: Arc::clone(&self.semaphore),
             config: self.config.clone(),
             state: self.state.clone(),
+            llm: self.llm.clone(),
         }
     }
 

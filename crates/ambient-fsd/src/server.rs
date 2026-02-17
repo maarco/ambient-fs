@@ -185,7 +185,12 @@ impl DaemonServer {
         *running = true;
         drop(running);
 
-        // Restore previously watched projects
+        // Start watcher FIRST (must be started before restore_projects calls watch())
+        let mut watcher_guard = self.watcher.lock().await;
+        let event_rx = watcher_guard.start()?;
+        drop(watcher_guard);
+
+        // Restore previously watched projects (now that watcher is live)
         self.restore_projects().await?;
 
         // Run initial prune cycle (catch up if daemon was down)
@@ -213,11 +218,6 @@ impl DaemonServer {
             tracing::info!("socket server bound to {}", self.config.socket_path.display());
         }
 
-        // Start watcher and get event receiver
-        let mut watcher_guard = self.watcher.lock().await;
-        let event_rx = watcher_guard.start()?;
-        drop(watcher_guard);
-
         // Spawn event handler task
         let store_path = self.config.db_path.clone();
         let running = self.running.clone();
@@ -226,8 +226,27 @@ impl DaemonServer {
 
         tokio::spawn(async move {
             let mut event_rx = event_rx;
-            while let Some(event) = event_rx.recv().await {
+            while let Some(mut event) = event_rx.recv().await {
                 if *running.lock().await {
+                    // Remap project_id from watcher default to actual project
+                    // The watcher uses "default" as project_id. Look up which
+                    // registered project this file path belongs to.
+                    {
+                        let projects = state.projects.read().await;
+                        for (pid, proj_path) in projects.iter() {
+                            if event.file_path.starts_with(proj_path.to_string_lossy().as_ref()) {
+                                event.project_id = pid.clone();
+                                break;
+                            }
+                        }
+                    }
+
+                    // Detect AI agent source: check if an agent is actively editing this file.
+                    // If so, override source to AiAgent regardless of what the watcher detected.
+                    if let Some(_agent_id) = state.agent_tracker.get_active_agent(&event.file_path).await {
+                        event.source = ambient_fs_core::event::Source::AiAgent;
+                    }
+
                     let path = store_path.clone();
                     let event_clone = event.clone();
 

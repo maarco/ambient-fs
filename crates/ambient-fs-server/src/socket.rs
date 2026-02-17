@@ -472,6 +472,9 @@ async fn handle_request(
         Method::Attribute => {
             handle_attribute(req, state).await
         }
+        Method::ReportAgentActivity => {
+            handle_report_agent_activity(req, state).await
+        }
     }
 }
 
@@ -1188,6 +1191,50 @@ async fn handle_attribute(req: Request, state: &ServerState) -> Response {
     debug!("Attributed file {} to source {}", file_path, source_str);
 
     Response::result(id, serde_json::json!({"attributed": true}))
+}
+
+/// Handle report_agent_activity request
+///
+/// Injects agent activity directly into the AgentTracker.
+/// This enables source attribution: files modified while an agent is
+/// active will get source = AiAgent instead of User.
+///
+/// Expects params: {"ts": 1234567890, "agent": "claude-code", "action": "edit",
+///                  "file": "/abs/path/to/file.rs"}
+/// Optional: "project", "tool", "session", "intent", "lines", "done"
+/// Returns: {"recorded": true}
+async fn handle_report_agent_activity(req: Request, state: &ServerState) -> Response {
+    use crate::agents::AgentActivity;
+
+    let id = req.id.clone();
+
+    let params = match extract_object_params(&req) {
+        Some(p) => p,
+        None => {
+            return Response::error(
+                id,
+                ProtocolError::invalid_params("params must be an object"),
+            );
+        }
+    };
+
+    // Parse AgentActivity from params
+    let activity: AgentActivity = match serde_json::from_value(serde_json::Value::Object(params.clone())) {
+        Ok(a) => a,
+        Err(e) => {
+            return Response::error(
+                id,
+                ProtocolError::invalid_params(format!("invalid activity params: {}", e)),
+            );
+        }
+    };
+
+    state.agent_tracker.update_from_activity(&activity).await;
+
+    debug!("Agent activity recorded: agent={} file={} done={:?}",
+           activity.agent, activity.file, activity.done);
+
+    Response::result(id, serde_json::json!({"recorded": true}))
 }
 
 #[cfg(test)]

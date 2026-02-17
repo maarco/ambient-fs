@@ -17,7 +17,7 @@ pub use agents::{AgentActivity, AgentState, AgentTracker};
 pub use awareness::{build_awareness, AwarenessError};
 pub use gateway::GatewayServer;
 pub use grpc::GrpcServer;
-pub use llm::{LlmClient, LlmConfig, LlmError};
+pub use llm::{LlmClient, LlmError};
 pub use pipeline::{AnalysisPipeline, PipelineConfig};
 pub use socket::{SocketServer, SocketError};
 pub use state::ServerState;

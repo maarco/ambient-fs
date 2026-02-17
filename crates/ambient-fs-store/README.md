@@ -11,7 +11,7 @@ SQLite event store for ambient-fs. Append-only event log with WAL mode for concu
   - `get_latest(project, path)` - Most recent event for a file
 
 - **Project CRUD** - Manage watched projects
-  - `add_project(project_id, path)` - Register a project
+  - `add_project(project_id, path)` - Register a project (idempotent, re-registering same project is a no-op)
   - `remove_project(project_id)` - Unregister a project
   - `get_project_path(project_id)` - Get path for a project
   - `list_projects()` - List all registered projects

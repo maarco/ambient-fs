@@ -193,7 +193,7 @@ async fn cmd_stop() -> Result<(), anyhow::Error> {
             println!("daemon stopped");
             Ok(())
         }
-        Err(daemon::DaemonError::NotRunning) => {
+        Err(daemon::DaemonError::NotRunning) | Err(daemon::DaemonError::PidFileRead(_)) => {
             println!("daemon not running");
             Ok(())
         }
@@ -214,16 +214,16 @@ async fn cmd_status() -> Result<(), anyhow::Error> {
 
 async fn cmd_watch(path: PathBuf) -> Result<(), anyhow::Error> {
     let canonical = path.canonicalize()?;
-    let config = server::ServerConfig::default();
-    let server = server::DaemonServer::new(config).await?;
+    let server_config = config::to_server_config(&config::load()?);
+    let server = server::DaemonServer::new(server_config).await?;
     let project_id = server.watch_project(canonical.clone()).await?;
     println!("watching: {} (id: {})", canonical.display(), project_id);
     Ok(())
 }
 
 async fn cmd_unwatch(id: String) -> Result<(), anyhow::Error> {
-    let config = server::ServerConfig::default();
-    let server = server::DaemonServer::new(config).await?;
+    let server_config = config::to_server_config(&config::load()?);
+    let server = server::DaemonServer::new(server_config).await?;
     server.unwatch_project(&id).await?;
     println!("unwatched project: {}", id);
     Ok(())
@@ -235,8 +235,8 @@ async fn cmd_events(
     project: Option<String>,
     limit: Option<usize>,
 ) -> Result<(), anyhow::Error> {
-    let config = server::ServerConfig::default();
-    let server = server::DaemonServer::new(config).await?;
+    let server_config = config::to_server_config(&config::load()?);
+    let server = server::DaemonServer::new(server_config).await?;
 
     let since_duration = since.and_then(|s| parse_duration(&s));
     let source_enum = source.and_then(|s| s.parse().ok());
@@ -282,8 +282,8 @@ async fn cmd_awareness(project: String, path: PathBuf) -> Result<(), anyhow::Err
     println!("querying awareness for project: {}", project);
     println!("  path: {}", path.display());
 
-    let config = server::ServerConfig::default();
-    let server = server::DaemonServer::new(config).await?;
+    let server_config = config::to_server_config(&config::load()?);
+    let server = server::DaemonServer::new(server_config).await?;
 
     // Get latest event for this file
     if let Some(event) = server.query_events(Some(&project), None, None, Some(1)).await?.first() {

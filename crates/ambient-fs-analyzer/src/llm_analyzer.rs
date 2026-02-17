@@ -22,7 +22,9 @@ pub enum LlmAnalyzerError {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmImport {
     pub path: String,
+    #[serde(default)]
     pub symbols: Vec<String>,
+    #[serde(default)]
     pub line: u32,
 }
 
@@ -30,18 +32,52 @@ pub struct LlmImport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmLintHint {
     pub line: u32,
+    #[serde(default)]
     pub column: u32,
     pub severity: String,
     pub message: String,
+    #[serde(default)]
     pub rule: Option<String>,
 }
 
 /// LLM analysis response structure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LlmAnalysisResponse {
+    /// Imports - accepts both object form {path, symbols, line} and plain string form.
+    #[serde(deserialize_with = "deserialize_imports", default)]
     pub imports: Vec<LlmImport>,
+    #[serde(default)]
     pub exports: Vec<String>,
+    #[serde(default)]
     pub lint_hints: Vec<LlmLintHint>,
+}
+
+/// Deserialize imports accepting both string and object formats.
+///
+/// Models may return:
+///   ["std::io", "std::collections::HashMap"]          (strings)
+///   [{"path": "std::io", "symbols": [], "line": 1}]  (objects)
+///   or a mix of both
+fn deserialize_imports<'de, D>(deserializer: D) -> Result<Vec<LlmImport>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values: Vec<serde_json::Value> = Vec::deserialize(deserializer)?;
+    let mut imports = Vec::new();
+    for v in values {
+        match v {
+            serde_json::Value::String(s) => {
+                imports.push(LlmImport { path: s, symbols: vec![], line: 0 });
+            }
+            serde_json::Value::Object(_) => {
+                let imp: LlmImport = serde_json::from_value(v)
+                    .map_err(serde::de::Error::custom)?;
+                imports.push(imp);
+            }
+            _ => {}
+        }
+    }
+    Ok(imports)
 }
 
 /// LLM file analyzer - builds prompts, parses responses, merges results.

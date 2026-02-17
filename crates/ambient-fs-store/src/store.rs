@@ -283,7 +283,7 @@ impl EventStore {
     pub fn add_project(&self, project_id: &str, path: &PathBuf) -> Result<()> {
         let created_at = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO projects (project_id, path, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO projects (project_id, path, created_at) VALUES (?1, ?2, ?3)",
             params![project_id, path.to_str().ok_or_else(|| StoreError::TimestampParse("invalid path".to_string()))?, &created_at],
         )?;
         Ok(())
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_duplicate_project_errors() {
+    fn test_add_duplicate_project_is_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let store = EventStore::new(db_path).unwrap();
@@ -617,9 +617,14 @@ mod tests {
         let path = PathBuf::from("/Users/test/my-project");
         store.add_project("proj-1", &path).unwrap();
 
-        // Second add with same project_id should fail
+        // Second add with same project_id is a no-op (INSERT OR IGNORE)
         let result = store.add_project("proj-1", &path);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+
+        // Still only one entry
+        let projects = store.list_projects().unwrap();
+        let count = projects.iter().filter(|(id, _)| id == "proj-1").count();
+        assert_eq!(count, 1);
     }
 
     #[test]
