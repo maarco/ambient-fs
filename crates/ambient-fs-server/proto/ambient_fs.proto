@@ -1,0 +1,105 @@
+syntax = "proto3";
+package ambient_fs;
+
+// gRPC service for ambient-fs daemon
+// Provides cross-machine access to file event streaming and queries
+service AmbientFs {
+  // unary RPCs (same as JSON-RPC methods)
+  rpc WatchProject(WatchProjectRequest) returns (WatchProjectResponse);
+  rpc UnwatchProject(UnwatchProjectRequest) returns (UnwatchProjectResponse);
+  rpc QueryEvents(QueryEventsRequest) returns (QueryEventsResponse);
+  rpc QueryAwareness(QueryAwarenessRequest) returns (AwarenessResponse);
+  rpc Attribute(AttributeRequest) returns (AttributeResponse);
+
+  // streaming RPCs (new, not in JSON-RPC)
+  rpc Subscribe(SubscribeRequest) returns (stream FileEventMessage);
+  rpc SyncEvents(SyncEventsRequest) returns (stream FileEventMessage);
+}
+
+// File event representation in protobuf
+message FileEventMessage {
+  int64 timestamp = 1;
+  string event_type = 2;
+  string file_path = 3;
+  string project_id = 4;
+  string source = 5;
+  optional string source_id = 6;
+  string machine_id = 7;
+  optional string content_hash = 8;
+  optional string old_path = 9;
+}
+
+// WatchProject: start watching a directory
+message WatchProjectRequest { string path = 1; }
+message WatchProjectResponse {
+  bool watching = 1;
+  string project_id = 2;
+}
+
+// UnwatchProject: stop watching a project
+message UnwatchProjectRequest { string project_id = 1; }
+message UnwatchProjectResponse { bool success = 1; }
+
+// QueryEvents: query event history
+message QueryEventsRequest {
+  optional string project_id = 1;
+  optional int64 since = 2;
+  optional string source = 3;
+  optional int32 limit = 4;
+}
+message QueryEventsResponse { repeated FileEventMessage events = 1; }
+
+// QueryAwareness: get file awareness info
+message QueryAwarenessRequest {
+  string project_id = 1;
+  string path = 2;
+}
+message AwarenessResponse {
+  string file_path = 1;
+  string project_id = 2;
+  optional string last_modified = 3;
+  optional string modified_by = 4;
+  string change_frequency = 5;
+  int32 todo_count = 6;
+  int32 lint_hints = 7;
+  int32 line_count = 8;
+  optional string active_agent = 9;
+}
+
+// Attribute: manually attribute a file event
+message AttributeRequest {
+  string file_path = 1;
+  string project_id = 2;
+  string source = 3;
+  optional string source_id = 4;
+}
+message AttributeResponse { bool attributed = 1; }
+
+// Subscribe: stream events for a project
+message SubscribeRequest { string project_id = 1; }
+
+// SyncEvents: stream events since a timestamp for cross-machine sync
+message SyncEventsRequest {
+  string project_id = 1;
+  string machine_id = 2;
+  int64 since_timestamp = 3;
+}
+
+// ========== Gateway Service (for relay mode) ==========
+
+// Gateway service for relaying events between daemons across NAT/firewalls
+service AmbientFsGateway {
+  // Register: daemon tells gateway which projects it cares about
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Relay: bidirectional stream for event relay between daemons
+  rpc Relay(stream FileEventMessage) returns (stream FileEventMessage);
+}
+
+// Register: daemon registers its presence for a project
+message RegisterRequest {
+  string project_id = 1;
+  string machine_id = 2;
+}
+message RegisterResponse {
+  bool registered = 1;
+}
