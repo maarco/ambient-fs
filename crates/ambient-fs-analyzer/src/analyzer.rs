@@ -10,6 +10,7 @@ use std::path::Path;
 /// - Imports (LLM-enhanced)
 /// - Exports (LLM-enhanced)
 /// - Lint hints (LLM-enhanced)
+#[derive(Clone)]
 pub struct FileAnalyzer {
     config: AnalyzerConfig,
     llm_enabled: bool,

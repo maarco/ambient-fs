@@ -14,7 +14,7 @@ mod tests {
         let conn = Connection::open(temp.path()).unwrap();
 
         conn.execute(
-            "CREATE TABLE events (
+            "CREATE TABLE file_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
@@ -35,14 +35,14 @@ mod tests {
         let recent = now - Duration::days(10);
 
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&old.to_rfc3339(), "created", "old.txt", "proj", "user", "m1"],
         )
         .unwrap();
 
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&recent.to_rfc3339(), "created", "new.txt", "proj", "user", "m1"],
         )
@@ -54,12 +54,12 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM file_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
 
         let path: String = conn
-            .query_row("SELECT file_path FROM events", [], |row| row.get(0))
+            .query_row("SELECT file_path FROM file_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(path, "new.txt");
     }
@@ -70,7 +70,7 @@ mod tests {
         let conn = Connection::open(temp.path()).unwrap();
 
         conn.execute(
-            "CREATE TABLE events (
+            "CREATE TABLE file_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
@@ -85,7 +85,7 @@ mod tests {
 
         let now = Utc::now();
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&now.to_rfc3339(), "created", "file.txt", "proj", "user", "m1"],
         )
@@ -103,7 +103,7 @@ mod tests {
         let conn = Connection::open(temp.path()).unwrap();
 
         conn.execute(
-            "CREATE TABLE events (
+            "CREATE TABLE file_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL
             )",
@@ -123,7 +123,7 @@ mod tests {
         let conn = Connection::open(temp.path()).unwrap();
 
         conn.execute(
-            "CREATE TABLE events (
+            "CREATE TABLE file_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
@@ -138,7 +138,7 @@ mod tests {
 
         let now = Utc::now();
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&now.to_rfc3339(), "created", "file.txt", "proj", "user", "m1"],
         )
@@ -150,7 +150,7 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM file_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -333,7 +333,7 @@ mod tests {
         let conn = Connection::open(temp.path()).unwrap();
 
         conn.execute(
-            "CREATE TABLE events (
+            "CREATE TABLE file_events (
                 id INTEGER PRIMARY KEY,
                 timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
@@ -349,14 +349,14 @@ mod tests {
         let now = Utc::now();
 
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&(now - Duration::days(5)).to_rfc3339(), "created", "keep.txt", "proj", "user", "m1"],
         )
         .unwrap();
 
         conn.execute(
-            "INSERT INTO events (timestamp, event_type, file_path, project_id, source, machine_id)
+            "INSERT INTO file_events (timestamp, event_type, file_path, project_id, source, machine_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             [&(now - Duration::days(20)).to_rfc3339(), "created", "delete.txt", "proj", "user", "m1"],
         )
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(deleted, 1);
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM file_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -417,7 +417,7 @@ impl EventPruner {
     pub fn prune_events_before(conn: &Connection, cutoff: DateTime<Utc>) -> Result<usize> {
         let cutoff_str = cutoff.to_rfc3339();
         conn.execute(
-            "DELETE FROM events WHERE timestamp < ?1",
+            "DELETE FROM file_events WHERE timestamp < ?1",
             [&cutoff_str],
         )
         .map_err(Into::into)

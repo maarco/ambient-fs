@@ -1,0 +1,13 @@
+[package]
+name = "e2e-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "e2e-test"
+path = "src/main.rs"
+
+[dependencies]
+ambient-fs-core = { path = "../ambient-fs-core" }
+ambient-fs-watcher = { path = "../ambient-fs-watcher" }
+tempfile = "3"

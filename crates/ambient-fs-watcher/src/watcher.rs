@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ambient_fs_core::{event::FileEvent, event::EventType, event::Source, filter::PathFilter};
+use ambient_fs_core::{event::FileEvent, event::EventType, filter::PathFilter};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -280,6 +280,7 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
     use tempfile::TempDir;
+    use ambient_fs_core::event::Source;
 
     #[test]
     fn new_watcher_has_debounce() {
@@ -630,17 +631,20 @@ mod tests {
         let file_path = temp_dir.path().join("dist").join("app.js");
         File::create(&file_path).unwrap().write_all(b"bundle").unwrap();
 
-        // Wait for event with retry
+        // Wait for file event (skip directory events)
         let mut found = false;
-        for _ in 0..20 {
+        for _ in 0..30 {
             if let Ok(event) = rx.try_recv() {
-                assert_eq!(event.source, Source::Build);
-                found = true;
-                break;
+                // Only care about file events, not directory events
+                if !event.file_path.ends_with("dist") && event.file_path.contains("dist") {
+                    assert_eq!(event.source, Source::Build);
+                    found = true;
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(found, "No event received");
+        assert!(found, "No file event received");
     }
 
     #[test]
@@ -699,9 +703,13 @@ mod tests {
         let mut found = false;
         for _ in 0..30 {
             if let Ok(event) = rx.try_recv() {
+                // Skip directory events
+                if event.file_path.ends_with("code") {
+                    continue;
+                }
                 assert_eq!(event.event_type, EventType::Created);
                 assert_eq!(event.source, Source::User);
-                assert!(event.content_hash.is_some(), "content_hash should be Some");
+                assert!(event.content_hash.is_some());
                 found = true;
                 break;
             }
@@ -726,17 +734,20 @@ mod tests {
         fs::create_dir_all(temp_dir.path().join("dist")).unwrap();
         File::create(&file_path).unwrap().write_all(b"object bytes").unwrap();
 
-        // Wait for event with retry
+        // Wait for file event (skip directory events)
         let mut found = false;
-        for _ in 0..20 {
+        for _ in 0..30 {
             if let Ok(event) = rx.try_recv() {
-                assert_eq!(event.source, Source::Build);
-                assert!(event.content_hash.is_some());
-                found = true;
-                break;
+                // Only care about file events
+                if event.file_path.ends_with("bundle.o") {
+                    assert_eq!(event.source, Source::Build);
+                    assert!(event.content_hash.is_some());
+                    found = true;
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(found, "No event received");
+        assert!(found, "No file event received");
     }
 }

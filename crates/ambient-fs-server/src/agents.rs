@@ -133,6 +133,8 @@ pub struct AgentTracker {
     agents: Arc<RwLock<HashMap<String, AgentState>>>,
     /// Timeout after which agents are considered stale
     stale_timeout: Duration,
+    /// File path -> reference count (how many times referenced in chat)
+    file_references: Arc<RwLock<HashMap<String, u32>>>,
 }
 
 impl AgentTracker {
@@ -141,6 +143,7 @@ impl AgentTracker {
         Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
             stale_timeout,
+            file_references: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -193,9 +196,14 @@ impl AgentTracker {
         } else {
             // Add file if not already present
             if !state.files.contains(&file) {
-                state.files.push(file);
+                state.files.push(file.clone());
             }
         }
+        drop(agents);
+
+        // Increment file reference count
+        let mut refs = self.file_references.write().await;
+        *refs.entry(file.clone()).or_insert(0) += 1;
     }
 
     /// Get the active agent for a specific file
@@ -241,11 +249,48 @@ impl AgentTracker {
     }
 
     /// Remove agents not seen within the stale timeout
+    ///
+    /// Also resets reference counts for files that are only referenced
+    /// by stale agents (files with at least one fresh agent reference are preserved).
     pub async fn prune_stale(&self) -> usize {
         let mut agents = self.agents.write().await;
+
+        // Collect files that stale agents have referenced
+        let mut stale_files: HashMap<String, u32> = HashMap::new();
+        let mut fresh_files: HashMap<String, u32> = HashMap::new();
+
+        for (_agent_id, state) in agents.iter() {
+            if state.is_stale(self.stale_timeout) {
+                // Count files referenced by stale agents
+                for file in &state.files {
+                    *stale_files.entry(file.clone()).or_insert(0) += 1;
+                }
+            } else {
+                // Count files referenced by fresh agents
+                for file in &state.files {
+                    *fresh_files.entry(file.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Remove stale agents
         let before = agents.len();
         agents.retain(|_, state| !state.is_stale(self.stale_timeout));
-        before - agents.len()
+        let pruned_count = before - agents.len();
+        drop(agents);
+
+        // Reset reference counts for files only referenced by stale agents
+        if !stale_files.is_empty() {
+            let mut refs = self.file_references.write().await;
+            for (file, _) in stale_files {
+                // Only reset if no fresh agent also references this file
+                if !fresh_files.contains_key(&file) {
+                    refs.remove(&file);
+                }
+            }
+        }
+
+        pruned_count
     }
 
     /// Calculate pass rate for a batch of lines
@@ -274,6 +319,15 @@ impl AgentTracker {
         agents.values()
             .filter(|state| !state.is_stale(self.stale_timeout))
             .count()
+    }
+
+    /// Get the reference count for a specific file
+    ///
+    /// Returns the number of times this file has been referenced
+    /// in agent activity (chat sessions).
+    pub async fn get_reference_count(&self, file_path: &str) -> u32 {
+        let refs = self.file_references.read().await;
+        refs.get(file_path).copied().unwrap_or(0)
     }
 }
 
@@ -866,5 +920,124 @@ mod tests {
         // Only file B still active
         assert!(tracker.get_active_agent("src/a.rs").await.is_none());
         assert_eq!(tracker.get_active_agent("src/b.rs").await, Some("agent-1".to_string()));
+    }
+
+    // ========== AgentTracker::get_reference_count ==========
+
+    #[tokio::test]
+    async fn get_reference_count_returns_zero_for_unknown_file() {
+        let tracker = AgentTracker::with_default_timeout();
+        assert_eq!(tracker.get_reference_count("unknown.rs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn get_reference_count_increments_on_activity() {
+        let tracker = AgentTracker::with_default_timeout();
+        let now = Utc::now().timestamp();
+
+        // First activity
+        let activity1 = AgentActivity::new(now, "agent-1", "edit", "src/main.rs");
+        tracker.update_from_activity(&activity1).await;
+
+        assert_eq!(tracker.get_reference_count("src/main.rs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_reference_count_accumulates_multiple_activities() {
+        let tracker = AgentTracker::with_default_timeout();
+        let now = Utc::now().timestamp();
+
+        // Multiple activities on same file
+        for i in 0..5 {
+            let activity = AgentActivity::new(now + i, "agent-1", "edit", "src/lib.rs");
+            tracker.update_from_activity(&activity).await;
+        }
+
+        assert_eq!(tracker.get_reference_count("src/lib.rs").await, 5);
+    }
+
+    #[tokio::test]
+    async fn get_reference_count_tracks_multiple_files_independently() {
+        let tracker = AgentTracker::with_default_timeout();
+        let now = Utc::now().timestamp();
+
+        // Activities on different files
+        let activity1 = AgentActivity::new(now, "agent-1", "edit", "src/a.rs");
+        tracker.update_from_activity(&activity1).await;
+
+        let activity2 = AgentActivity::new(now + 1, "agent-2", "edit", "src/b.rs");
+        tracker.update_from_activity(&activity2).await;
+
+        let activity3 = AgentActivity::new(now + 2, "agent-1", "read", "src/a.rs");
+        tracker.update_from_activity(&activity3).await;
+
+        assert_eq!(tracker.get_reference_count("src/a.rs").await, 2);
+        assert_eq!(tracker.get_reference_count("src/b.rs").await, 1);
+    }
+
+    #[tokio::test]
+    async fn get_reference_count_survives_done_activity() {
+        let tracker = AgentTracker::with_default_timeout();
+        let now = Utc::now().timestamp();
+
+        // Activity that marks file as done still counts as a reference
+        let mut activity = AgentActivity::new(now, "agent-1", "edit", "src/foo.rs");
+        activity.done = Some(true);
+        tracker.update_from_activity(&activity).await;
+
+        assert_eq!(tracker.get_reference_count("src/foo.rs").await, 1);
+    }
+
+    // ========== AgentTracker::prune_stale with file_references ==========
+
+    #[tokio::test]
+    async fn prune_stale_resets_counts_for_stale_agent_files() {
+        let tracker = AgentTracker::new(Duration::seconds(60));
+        let now = Utc::now().timestamp();
+
+        // Fresh agent activity on file A
+        let activity1 = AgentActivity::new(now, "fresh-agent", "edit", "src/a.rs");
+        tracker.update_from_activity(&activity1).await;
+
+        // Stale agent activity on file B
+        let old_ts = (Utc::now() - Duration::seconds(61)).timestamp();
+        let activity2 = AgentActivity::new(old_ts, "stale-agent", "edit", "src/b.rs");
+        tracker.update_from_activity(&activity2).await;
+
+        // Both files have counts
+        assert_eq!(tracker.get_reference_count("src/a.rs").await, 1);
+        assert_eq!(tracker.get_reference_count("src/b.rs").await, 1);
+
+        // Prune stale agents
+        tracker.prune_stale().await;
+
+        // File B count should be reset (only stale agent referenced it)
+        assert_eq!(tracker.get_reference_count("src/a.rs").await, 1);
+        assert_eq!(tracker.get_reference_count("src/b.rs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_stale_preserves_counts_for_shared_files() {
+        let tracker = AgentTracker::new(Duration::seconds(60));
+        let now = Utc::now().timestamp();
+
+        // Fresh agent on file A
+        let activity1 = AgentActivity::new(now, "fresh-agent", "edit", "src/shared.rs");
+        tracker.update_from_activity(&activity1).await;
+
+        // Stale agent also on file A
+        let old_ts = (Utc::now() - Duration::seconds(61)).timestamp();
+        let activity2 = AgentActivity::new(old_ts, "stale-agent", "read", "src/shared.rs");
+        tracker.update_from_activity(&activity2).await;
+
+        // Count is 2
+        assert_eq!(tracker.get_reference_count("src/shared.rs").await, 2);
+
+        // Prune stale agents
+        tracker.prune_stale().await;
+
+        // Count stays at 2 because fresh agent also references this file
+        // (we can't decrement per-agent counts without per-agent tracking)
+        assert_eq!(tracker.get_reference_count("src/shared.rs").await, 2);
     }
 }

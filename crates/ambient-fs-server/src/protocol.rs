@@ -203,6 +203,7 @@ pub enum Method {
     WatchAgents,
     UnwatchAgents,
     QueryAgents,
+    QueryTree,
     Attribute,
 }
 
@@ -218,6 +219,7 @@ impl Method {
             Self::WatchAgents => "watch_agents",
             Self::UnwatchAgents => "unwatch_agents",
             Self::QueryAgents => "query_agents",
+            Self::QueryTree => "query_tree",
             Self::Attribute => "attribute",
         }
     }
@@ -243,6 +245,7 @@ impl std::str::FromStr for Method {
             "watch_agents" => Ok(Self::WatchAgents),
             "unwatch_agents" => Ok(Self::UnwatchAgents),
             "query_agents" => Ok(Self::QueryAgents),
+            "query_tree" => Ok(Self::QueryTree),
             "attribute" => Ok(Self::Attribute),
             _ => Err(MethodParseError(s.to_string())),
         }
@@ -466,6 +469,7 @@ mod tests {
         assert_eq!(Method::WatchAgents.as_str(), "watch_agents");
         assert_eq!(Method::UnwatchAgents.as_str(), "unwatch_agents");
         assert_eq!(Method::QueryAgents.as_str(), "query_agents");
+        assert_eq!(Method::QueryTree.as_str(), "query_tree");
         assert_eq!(Method::Attribute.as_str(), "attribute");
     }
 
@@ -480,6 +484,7 @@ mod tests {
         assert_eq!("watch_agents".parse::<Method>().unwrap(), Method::WatchAgents);
         assert_eq!("unwatch_agents".parse::<Method>().unwrap(), Method::UnwatchAgents);
         assert_eq!("query_agents".parse::<Method>().unwrap(), Method::QueryAgents);
+        assert_eq!("query_tree".parse::<Method>().unwrap(), Method::QueryTree);
         assert_eq!("attribute".parse::<Method>().unwrap(), Method::Attribute);
     }
 

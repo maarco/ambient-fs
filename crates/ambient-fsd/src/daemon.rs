@@ -172,18 +172,21 @@ impl Daemon {
     }
 
     /// Set custom PID file path.
+    #[allow(dead_code)]
     pub fn with_pid_file(mut self, path: &'static str) -> Self {
         self.pid_file = PidFile::new(path);
         self
     }
 
     /// Set custom log file path.
+    #[allow(dead_code)]
     pub fn with_log_file(mut self, path: &'static str) -> Self {
         self.log_file = path;
         self
     }
 
     /// Create PID file (public for use in main.rs)
+    #[allow(dead_code)]
     pub fn create_pid_file(&self) -> Result<()> {
         self.pid_file.create()
     }
@@ -263,6 +266,11 @@ impl Daemon {
     /// Check if shutdown was requested.
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Get the shutdown flag for sharing with other components.
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
     }
 
     /// Check if running in foreground mode.

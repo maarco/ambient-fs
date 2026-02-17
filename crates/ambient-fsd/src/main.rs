@@ -4,7 +4,8 @@ mod config;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::time::Duration;
+use chrono::TimeDelta;
+use rusqlite::Connection;
 
 /// Ambient filesystem awareness daemon
 #[derive(Debug, Clone, Parser)]
@@ -68,6 +69,16 @@ enum Command {
         #[arg(value_name = "PATH")]
         path: PathBuf,
     },
+    /// Prune old events and analysis records
+    Prune {
+        /// Retention period in days (default: 90)
+        #[arg(short = 'r', long, default_value = "90")]
+        retention_days: i64,
+    },
+    /// Install service file for auto-start on login
+    InstallService,
+    /// Uninstall service file
+    UninstallService,
 }
 
 #[tokio::main]
@@ -87,6 +98,9 @@ async fn main() {
             limit,
         } => cmd_events(since, source, project, limit).await,
         Command::Awareness { project, path } => cmd_awareness(project, path).await,
+        Command::Prune { retention_days } => cmd_prune(retention_days).await,
+        Command::InstallService => cmd_install_service(),
+        Command::UninstallService => cmd_uninstall_service(),
     };
 
     if let Err(e) = result {
@@ -110,6 +124,18 @@ async fn cmd_start(foreground: bool) -> Result<(), anyhow::Error> {
 
     let daemon = daemon::Daemon::new().with_foreground(foreground);
 
+    // Log whether we're running in foreground mode
+    if daemon.is_foreground() {
+        tracing::info!("starting daemon in foreground mode");
+    } else {
+        tracing::info!("starting daemon in background mode");
+    }
+
+    // Verify shutdown state before starting
+    if daemon.is_shutdown_requested() {
+        tracing::warn!("shutdown flag already set before start");
+    }
+
     // Check if already running (ignore PidFileRead errors)
     let already_running = match daemon.status() {
         Ok(Some(pid)) => {
@@ -125,12 +151,13 @@ async fn cmd_start(foreground: bool) -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    // Create PID file
-    daemon.create_pid_file()?;
+    // Start daemon (forks, sets up signals, redirects stdio, creates PID file)
+    daemon.start()?;
 
     // Convert DaemonConfig to ServerConfig
     let server_config = config::to_server_config(&daemon_config);
-    let server = server::DaemonServer::new(server_config).await?;
+    let server = server::DaemonServer::new(server_config).await?
+        .with_shutdown_flag(daemon.shutdown_flag());
     println!("daemon started (PID {})", std::process::id());
 
     // Run server (blocks until shutdown)
@@ -193,8 +220,6 @@ async fn cmd_events(
     project: Option<String>,
     limit: Option<usize>,
 ) -> Result<(), anyhow::Error> {
-    use ambient_fs_core::event::Source;
-
     let config = server::ServerConfig::default();
     let server = server::DaemonServer::new(config).await?;
 
@@ -224,16 +249,16 @@ async fn cmd_events(
 }
 
 /// Parse duration string like "1h", "30m", "7d"
-fn parse_duration(s: &str) -> Option<Duration> {
+fn parse_duration(s: &str) -> Option<TimeDelta> {
     let num = s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>();
-    let num: u64 = num.parse().ok()?;
+    let num: i64 = num.parse().ok()?;
     let suffix = s.chars().skip_while(|c| c.is_ascii_digit()).collect::<String>();
 
     match suffix.as_str() {
-        "s" | "sec" => Some(Duration::from_secs(num)),
-        "m" | "min" => Some(Duration::from_secs(num * 60)),
-        "h" | "hour" => Some(Duration::from_secs(num * 3600)),
-        "d" | "day" => Some(Duration::from_secs(num * 86400)),
+        "s" | "sec" => Some(TimeDelta::seconds(num)),
+        "m" | "min" => Some(TimeDelta::minutes(num)),
+        "h" | "hour" => Some(TimeDelta::hours(num)),
+        "d" | "day" => Some(TimeDelta::days(num)),
         _ => None,
     }
 }
@@ -251,6 +276,155 @@ async fn cmd_awareness(project: String, path: PathBuf) -> Result<(), anyhow::Err
         println!("  modified by: {}", event.source);
     } else {
         println!("  no events found");
+    }
+
+    Ok(())
+}
+
+async fn cmd_prune(retention_days: i64) -> Result<(), anyhow::Error> {
+    use ambient_fs_store::{EventPruner, PruneConfig, migrations};
+
+    let config = server::ServerConfig::default();
+    let db_path = config.db_path;
+
+    println!("pruning events older than {} days...", retention_days);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let prune_config = PruneConfig::new(retention_days);
+        let cutoff = prune_config.cutoff_timestamp();
+        let conn = Connection::open(&db_path)?;
+
+        // Ensure schema exists
+        migrations::ensure_schema(&conn)?;
+
+        let events = EventPruner::prune_events_before(&conn, cutoff)?;
+        let analysis = EventPruner::prune_analysis_before(&conn, cutoff)?;
+
+        if events > 0 || analysis > 0 {
+            EventPruner::vacuum(&conn)?;
+        }
+
+        Ok::<_, anyhow::Error>((events, analysis))
+    }).await??;
+
+    println!("pruned {} events, {} analysis records", result.0, result.1);
+    Ok(())
+}
+
+/// Service file templates embedded at compile time
+#[cfg(target_os = "macos")]
+const LAUNCHD_PLIST_TEMPLATE: &str = include_str!("../../../deploy/com.ambient-fs.daemon.plist");
+
+#[cfg(target_os = "linux")]
+const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../../../deploy/ambient-fsd.service");
+
+fn cmd_install_service() -> Result<(), anyhow::Error> {
+    let binary = std::env::current_exe()?;
+    let binary_path = binary.display().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME")?;
+        let service_dir = format!("{}/Library/LaunchAgents", home);
+        let service_path = format!("{}/com.ambient-fs.daemon.plist", service_dir);
+
+        // Create directory if it doesn't exist
+        std::fs::create_dir_all(&service_dir)?;
+
+        // Replace {BINARY} placeholder with actual binary path
+        let plist_content = LAUNCHD_PLIST_TEMPLATE.replace("{BINARY}", &binary_path);
+
+        // Write the service file
+        std::fs::write(&service_path, plist_content)?;
+
+        println!("service file installed to: {}", service_path);
+        println!();
+        println!("to enable and start the service, run:");
+        println!("  launchctl load {}", service_path);
+        println!();
+        println!("to check status:");
+        println!("  launchctl list | grep com.ambient-fs");
+        println!();
+        println!("to stop and unload:");
+        println!("  launchctl unload {}", service_path);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME")?;
+        let service_dir = format!("{}/.config/systemd/user", home);
+        let service_path = format!("{}/ambient-fsd.service", service_dir);
+
+        // Create directory if it doesn't exist
+        std::fs::create_dir_all(&service_dir)?;
+
+        // Replace {BINARY} placeholder with actual binary path
+        let service_content = SYSTEMD_SERVICE_TEMPLATE.replace("{BINARY}", &binary_path);
+
+        // Write the service file
+        std::fs::write(&service_path, service_content)?;
+
+        println!("service file installed to: {}", service_path);
+        println!();
+        println!("to enable and start the service, run:");
+        println!("  systemctl --user daemon-reload");
+        println!("  systemctl --user enable ambient-fsd");
+        println!("  systemctl --user start ambient-fsd");
+        println!();
+        println!("to check status:");
+        println!("  systemctl --user status ambient-fsd");
+        println!();
+        println!("to stop and disable:");
+        println!("  systemctl --user stop ambient-fsd");
+        println!("  systemctl --user disable ambient-fsd");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("install-service not supported on this platform");
+    }
+
+    Ok(())
+}
+
+fn cmd_uninstall_service() -> Result<(), anyhow::Error> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME")?;
+        let service_path = format!("{}/Library/LaunchAgents/com.ambient-fs.daemon.plist", home);
+
+        if std::fs::exists(&service_path)? || std::fs::metadata(&service_path).is_ok() {
+            std::fs::remove_file(&service_path)?;
+            println!("service file removed: {}", service_path);
+            println!();
+            println!("if the service was loaded, unload it with:");
+            println!("  launchctl unload {}", service_path);
+        } else {
+            println!("service file not found: {}", service_path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME")?;
+        let service_path = format!("{}/.config/systemd/user/ambient-fsd.service", home);
+
+        if std::fs::exists(&service_path)? || std::fs::metadata(&service_path).is_ok() {
+            std::fs::remove_file(&service_path)?;
+            println!("service file removed: {}", service_path);
+            println!();
+            println!("if the service was enabled, disable it with:");
+            println!("  systemctl --user stop ambient-fsd");
+            println!("  systemctl --user disable ambient-fsd");
+            println!("  systemctl --user daemon-reload");
+        } else {
+            println!("service file not found: {}", service_path);
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        anyhow::bail!("uninstall-service not supported on this platform");
     }
 
     Ok(())
@@ -492,6 +666,39 @@ mod tests {
     }
 
     #[test]
+    fn cli_prune_default_retention() {
+        let cli = Cli::parse_from(["ambient-fsd", "prune"]);
+        match cli.command {
+            Command::Prune { retention_days } => {
+                assert_eq!(retention_days, 90);
+            }
+            _ => panic!("expected Prune command"),
+        }
+    }
+
+    #[test]
+    fn cli_prune_custom_retention_short() {
+        let cli = Cli::parse_from(["ambient-fsd", "prune", "-r", "30"]);
+        match cli.command {
+            Command::Prune { retention_days } => {
+                assert_eq!(retention_days, 30);
+            }
+            _ => panic!("expected Prune command"),
+        }
+    }
+
+    #[test]
+    fn cli_prune_custom_retention_long() {
+        let cli = Cli::parse_from(["ambient-fsd", "prune", "--retention-days", "14"]);
+        match cli.command {
+            Command::Prune { retention_days } => {
+                assert_eq!(retention_days, 14);
+            }
+            _ => panic!("expected Prune command"),
+        }
+    }
+
+    #[test]
     fn cli_long_about() {
         let cmd = Cli::command();
         assert!(cmd.get_about().is_some());
@@ -507,5 +714,55 @@ mod tests {
     fn cli_name() {
         let cmd = Cli::command();
         assert_eq!(cmd.get_name(), "ambient-fsd");
+    }
+
+    #[test]
+    fn cli_install_service() {
+        let cli = Cli::parse_from(["ambient-fsd", "install-service"]);
+        assert!(matches!(cli.command, Command::InstallService));
+    }
+
+    #[test]
+    fn cli_uninstall_service() {
+        let cli = Cli::parse_from(["ambient-fsd", "uninstall-service"]);
+        assert!(matches!(cli.command, Command::UninstallService));
+    }
+
+    #[test]
+    fn test_launchd_template_renders() {
+        let result = LAUNCHD_PLIST_TEMPLATE.replace("{BINARY}", "/usr/local/bin/ambient-fsd");
+        assert!(result.contains("/usr/local/bin/ambient-fsd"));
+        assert!(result.contains("com.ambient-fs.daemon"));
+        assert!(result.contains("start"));
+        assert!(result.contains("--foreground"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_systemd_template_renders() {
+        let result = SYSTEMD_SERVICE_TEMPLATE.replace("{BINARY}", "/usr/local/bin/ambient-fsd");
+        assert!(result.contains("/usr/local/bin/ambient-fsd"));
+        assert!(result.contains("ExecStart"));
+        assert!(result.contains("Restart=on-failure"));
+        assert!(result.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn test_launchd_template_contains_expected_keys() {
+        assert!(LAUNCHD_PLIST_TEMPLATE.contains("{BINARY}"));
+        assert!(LAUNCHD_PLIST_TEMPLATE.contains("Label"));
+        assert!(LAUNCHD_PLIST_TEMPLATE.contains("ProgramArguments"));
+        assert!(LAUNCHD_PLIST_TEMPLATE.contains("RunAtLoad"));
+        assert!(LAUNCHD_PLIST_TEMPLATE.contains("KeepAlive"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_systemd_template_contains_expected_keys() {
+        assert!(SYSTEMD_SERVICE_TEMPLATE.contains("{BINARY}"));
+        assert!(SYSTEMD_SERVICE_TEMPLATE.contains("ExecStart"));
+        assert!(SYSTEMD_SERVICE_TEMPLATE.contains("Type=simple"));
+        assert!(SYSTEMD_SERVICE_TEMPLATE.contains("Restart=on-failure"));
+        assert!(SYSTEMD_SERVICE_TEMPLATE.contains("RestartSec=5"));
     }
 }

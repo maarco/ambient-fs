@@ -102,6 +102,10 @@ pub fn to_server_config(config: &DaemonConfig) -> crate::server::ServerConfig {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::sync::Mutex;
+
+    // Mutex to serialize env var access in tests
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     // ========== default_db_path ==========
 
@@ -118,6 +122,7 @@ mod tests {
 
     #[test]
     fn config_path_default_ends_with_config_toml() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         // Clear env var for default behavior
         std::env::remove_var("AMBIENT_FS_CONFIG");
         let path = config_path();
@@ -128,6 +133,7 @@ mod tests {
 
     #[test]
     fn config_path_env_override() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         std::env::set_var("AMBIENT_FS_CONFIG", "/custom/path/config.toml");
         let path = config_path();
         assert_eq!(path, PathBuf::from("/custom/path/config.toml"));
@@ -187,6 +193,7 @@ mod tests {
 
     #[test]
     fn save_creates_config_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
 
@@ -215,6 +222,7 @@ mod tests {
 
     #[test]
     fn save_creates_parent_dir() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let nested_dir = temp_dir.path().join("nested").join("dir");
         let config_path = nested_dir.join("config.toml");
@@ -232,6 +240,7 @@ mod tests {
 
     #[test]
     fn save_writes_valid_toml() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         std::env::set_var("AMBIENT_FS_CONFIG", config_path.to_str().unwrap());
@@ -252,6 +261,7 @@ mod tests {
 
     #[test]
     fn load_creates_default_when_missing() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         std::env::set_var("AMBIENT_FS_CONFIG", config_path.to_str().unwrap());
@@ -273,6 +283,7 @@ mod tests {
 
     #[test]
     fn load_reads_existing_config() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         std::env::set_var("AMBIENT_FS_CONFIG", config_path.to_str().unwrap());
@@ -299,6 +310,7 @@ mod tests {
 
     #[test]
     fn load_preserves_machine_id() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.toml");
         std::env::set_var("AMBIENT_FS_CONFIG", config_path.to_str().unwrap());

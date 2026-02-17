@@ -1,0 +1,29 @@
+{
+  "name": "@ambient-fs/client",
+  "version": "0.1.0",
+  "description": "Node.js client for ambient-fs filesystem awareness daemon",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "test:unit": "jest test/unit",
+    "test:integration": "jest test/integration",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["filesystem", "watcher", "daemon", "ipc"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20",
+    "typescript": "^5",
+    "jest": "^29",
+    "@types/jest": "^29",
+    "ts-jest": "^29"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {},
+  "dependencies": {}
+}

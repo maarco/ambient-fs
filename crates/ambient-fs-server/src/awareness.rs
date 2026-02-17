@@ -2,7 +2,6 @@
 // TDD: Tests FIRST, then implementation
 
 use ambient_fs_core::awareness::FileAwareness;
-use ambient_fs_core::event::Source;
 use ambient_fs_store::{EventStore, FileAnalysisCache};
 
 use crate::state::ServerState;
@@ -67,8 +66,9 @@ pub async fn build_awareness(
     .await
     .map_err(|e| AwarenessError::Cache(format!("join error: {}", e)))??;
 
-    // Step 3: Get active agent
+    // Step 3: Get active agent and reference count
     let active_agent = state.get_active_agent(file_path).await;
+    let chat_references = state.agent_tracker.get_reference_count(file_path).await;
 
     // Step 4: Combine into FileAwareness
     let mut awareness = FileAwareness::from_event_minimal(
@@ -88,6 +88,9 @@ pub async fn build_awareness(
     // Set active agent
     awareness.active_agent = active_agent;
 
+    // Set chat references
+    awareness.chat_references = chat_references;
+
     // Set modified_by_label if source_id exists (e.g., chat session id)
     awareness.modified_by_label = event.source_id;
 
@@ -97,7 +100,7 @@ pub async fn build_awareness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ambient_fs_core::event::{FileEvent, EventType};
+    use ambient_fs_core::event::{FileEvent, EventType, Source};
     use tempfile::tempdir;
 
     fn make_test_event(project_id: &str, file_path: &str) -> FileEvent {
@@ -318,5 +321,89 @@ mod tests {
         assert_eq!(awareness.todo_count, 0);
         assert_eq!(awareness.lint_hints, 0);
         assert_eq!(awareness.line_count, 0);
+    }
+
+    #[tokio::test]
+    async fn build_awareness_with_no_activity_has_zero_chat_references() {
+        let temp_dir = tempdir().unwrap();
+        let store_path = temp_dir.path().join("events.db");
+        let state = ServerState::new(store_path.clone());
+
+        // Insert event
+        let event = make_test_event("proj-1", "src/main.rs");
+        let store = EventStore::new(store_path).unwrap();
+        store.insert(&event).unwrap();
+
+        // No agent activity
+
+        let result = build_awareness(&state, "proj-1", "src/main.rs").await;
+
+        assert!(result.is_ok());
+        let awareness = result.unwrap().unwrap();
+        assert_eq!(awareness.chat_references, 0);
+    }
+
+    #[tokio::test]
+    async fn build_awareness_with_activity_has_nonzero_chat_references() {
+        let temp_dir = tempdir().unwrap();
+        let store_path = temp_dir.path().join("events.db");
+        let state = ServerState::new(store_path.clone());
+
+        // Insert event
+        let event = make_test_event("proj-1", "src/main.rs");
+        let store = EventStore::new(store_path).unwrap();
+        store.insert(&event).unwrap();
+
+        // Add agent activity
+        use crate::agents::AgentActivity;
+        let now = chrono::Utc::now().timestamp();
+        let activity = AgentActivity::new(now, "agent-1", "edit", "src/main.rs");
+        state.update_agent_activity(&activity).await;
+
+        // Add another activity on same file
+        let activity2 = AgentActivity::new(now + 1, "agent-1", "read", "src/main.rs");
+        state.update_agent_activity(&activity2).await;
+
+        let result = build_awareness(&state, "proj-1", "src/main.rs").await;
+
+        assert!(result.is_ok());
+        let awareness = result.unwrap().unwrap();
+        assert_eq!(awareness.chat_references, 2);
+    }
+
+    #[tokio::test]
+    async fn build_awareness_chat_references_independent_per_file() {
+        let temp_dir = tempdir().unwrap();
+        let store_path = temp_dir.path().join("events.db");
+        let state = ServerState::new(store_path.clone());
+
+        // Insert events for two files
+        let event1 = make_test_event("proj-1", "src/a.rs");
+        let event2 = make_test_event("proj-1", "src/b.rs");
+        let store = EventStore::new(store_path).unwrap();
+        store.insert(&event1).unwrap();
+        store.insert(&event2).unwrap();
+
+        // Add activity: 3 refs to a.rs, 1 ref to b.rs
+        use crate::agents::AgentActivity;
+        let now = chrono::Utc::now().timestamp();
+        for _ in 0..3 {
+            let activity = AgentActivity::new(now, "agent-1", "edit", "src/a.rs");
+            state.update_agent_activity(&activity).await;
+        }
+        let activity = AgentActivity::new(now, "agent-1", "edit", "src/b.rs");
+        state.update_agent_activity(&activity).await;
+
+        // Check a.rs
+        let result_a = build_awareness(&state, "proj-1", "src/a.rs").await;
+        assert!(result_a.is_ok());
+        let awareness_a = result_a.unwrap().unwrap();
+        assert_eq!(awareness_a.chat_references, 3);
+
+        // Check b.rs
+        let result_b = build_awareness(&state, "proj-1", "src/b.rs").await;
+        assert!(result_b.is_ok());
+        let awareness_b = result_b.unwrap().unwrap();
+        assert_eq!(awareness_b.chat_references, 1);
     }
 }

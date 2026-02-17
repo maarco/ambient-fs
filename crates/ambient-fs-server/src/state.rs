@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock};
 use ambient_fs_watcher::FsWatcher;
 use crate::agents::AgentTracker;
 use crate::subscriptions::SubscriptionManager;
+use crate::tree_state::ProjectTree;
 
 /// Shared state accessible to all connection handlers
 #[derive(Clone)]
@@ -21,6 +22,8 @@ pub struct ServerState {
     pub projects: Arc<RwLock<HashMap<String, PathBuf>>>,
     /// Project ID -> Watcher mapping (one watcher per project)
     pub watchers: Arc<RwLock<HashMap<String, Arc<Mutex<FsWatcher>>>>>,
+    /// Project ID -> ProjectTree mapping (live file trees)
+    pub trees: Arc<RwLock<HashMap<String, ProjectTree>>>,
     /// Machine ID for event attribution
     pub machine_id: String,
     /// Agent activity tracker
@@ -35,6 +38,7 @@ impl ServerState {
             subscriptions: SubscriptionManager::new(),
             projects: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
+            trees: Arc::new(RwLock::new(HashMap::new())),
             machine_id: hostname::get()
                 .ok()
                 .and_then(|h| h.into_string().ok())
@@ -50,6 +54,7 @@ impl ServerState {
             subscriptions: SubscriptionManager::new(),
             projects: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
+            trees: Arc::new(RwLock::new(HashMap::new())),
             machine_id,
             agent_tracker: AgentTracker::with_default_timeout(),
         }
@@ -106,6 +111,24 @@ impl ServerState {
     pub async fn remove_watcher(&self, project_id: &str) -> Option<Arc<Mutex<FsWatcher>>> {
         let mut watchers = self.watchers.write().await;
         watchers.remove(project_id)
+    }
+
+    /// Get a project tree
+    pub async fn get_tree(&self, project_id: &str) -> Option<ProjectTree> {
+        let trees = self.trees.read().await;
+        trees.get(project_id).cloned()
+    }
+
+    /// Add a project tree
+    pub async fn add_tree(&self, project_id: String, tree: ProjectTree) {
+        let mut trees = self.trees.write().await;
+        trees.insert(project_id, tree);
+    }
+
+    /// Remove a project tree
+    pub async fn remove_tree(&self, project_id: &str) -> Option<ProjectTree> {
+        let mut trees = self.trees.write().await;
+        trees.remove(project_id)
     }
 
     /// Get the active agent for a specific file
@@ -291,7 +314,7 @@ mod tests {
             "test-project",
             "test-machine",
         );
-        state.subscriptions.broadcast(event).await;
+        state.subscriptions.publish_event(event).await;
     }
 
     // ========== Clone behavior ==========
@@ -369,5 +392,47 @@ mod tests {
     fn with_machine_id_uses_custom_id() {
         let state = ServerState::with_machine_id(PathBuf::from("/tmp/test.db"), "custom-machine".to_string());
         assert_eq!(state.machine_id, "custom-machine");
+    }
+
+    // ========== ServerState::trees ==========
+
+    #[tokio::test]
+    async fn new_has_empty_trees() {
+        let state = ServerState::new(PathBuf::from("/tmp/test.db"));
+        let tree = state.get_tree("proj-1").await;
+        assert!(tree.is_none());
+    }
+
+    #[tokio::test]
+    async fn add_tree_stores_tree() {
+        let state = ServerState::new(PathBuf::from("/tmp/test.db"));
+        let tree = ProjectTree::new("proj-1".to_string());
+
+        state.add_tree("proj-1".to_string(), tree).await;
+
+        let retrieved = state.get_tree("proj-1").await;
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().project_id, "proj-1");
+    }
+
+    #[tokio::test]
+    async fn remove_tree_removes_from_state() {
+        let state = ServerState::new(PathBuf::from("/tmp/test.db"));
+        let tree = ProjectTree::new("proj-1".to_string());
+        state.add_tree("proj-1".to_string(), tree).await;
+
+        let removed = state.remove_tree("proj-1").await;
+        assert!(removed.is_some());
+
+        let retrieved = state.get_tree("proj-1").await;
+        assert!(retrieved.is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_tree_returns_none() {
+        let state = ServerState::new(PathBuf::from("/tmp/test.db"));
+
+        let removed = state.remove_tree("nonexistent").await;
+        assert!(removed.is_none());
     }
 }

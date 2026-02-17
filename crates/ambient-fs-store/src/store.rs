@@ -191,7 +191,6 @@ impl EventStore {
         if let Some(since) = filter.since {
             conditions.push(format!("timestamp >= ?{}", param_idx));
             bind_params.push(Box::new(since.to_rfc3339()));
-            param_idx += 1;
         }
 
         if !conditions.is_empty() {

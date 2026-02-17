@@ -20,6 +20,13 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 hostname = "0.4"
 chrono = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

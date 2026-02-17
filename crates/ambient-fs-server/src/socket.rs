@@ -1,7 +1,7 @@
 // Unix socket server using tokio::net::UnixListener
 // TDD: Tests FIRST, then implementation
 
-use ambient_fs_core::FileEvent;
+use crate::subscriptions::Notification;
 use std::collections::HashMap;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ use crate::state::ServerState;
 /// is subscribed to. When dropped, all receivers are dropped.
 #[derive(Debug)]
 struct ConnectionState {
-    /// project_id -> broadcast receiver for that project's events
-    subscriptions: HashMap<String, broadcast::Receiver<FileEvent>>,
+    /// project_id -> broadcast receiver for that project's notifications
+    subscriptions: HashMap<String, broadcast::Receiver<Notification>>,
 }
 
 impl ConnectionState {
@@ -34,7 +34,7 @@ impl ConnectionState {
     }
 
     /// Add a subscription receiver for a project
-    fn add_subscription(&mut self, project_id: String, rx: broadcast::Receiver<FileEvent>) {
+    fn add_subscription(&mut self, project_id: String, rx: broadcast::Receiver<Notification>) {
         self.subscriptions.insert(project_id, rx);
     }
 
@@ -44,7 +44,9 @@ impl ConnectionState {
     }
 
     /// Get a mutable reference to a specific subscription receiver
-    fn get_receiver(&mut self, project_id: &str) -> Option<&mut broadcast::Receiver<FileEvent>> {
+    ///
+    /// This is useful for direct access to a project's notification stream.
+    pub fn get_receiver(&mut self, project_id: &str) -> Option<&mut broadcast::Receiver<Notification>> {
         self.subscriptions.get_mut(project_id)
     }
 
@@ -246,21 +248,51 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, state: Arc<Server
             let mut found_receiver = None;
             let mut project_id = String::new();
 
-            for (pid, rx) in conn_state.subscriptions.iter_mut() {
-                // Try a non-blocking recv
-                match rx.try_recv() {
-                    Ok(event) => {
-                        // We got an event, send it as a notification
-                        let notification = serde_json::json!({
+            // Use get_receiver API for cleaner access
+            for pid in conn_state.subscriptions.keys().cloned().collect::<Vec<_>>() {
+                if let Some(rx) = conn_state.get_receiver(&pid) {
+                    // Try a non-blocking recv
+                    match rx.try_recv() {
+                    Ok(notification) => {
+                        // We got a notification, send it with appropriate method name
+                        let (method, params) = match &notification {
+                            Notification::Event(event) => {
+                                ("event", serde_json::to_value(event).unwrap_or(serde_json::json!(null)))
+                            }
+                            Notification::AwarenessChanged { project_id, file_path, awareness } => {
+                                ("awareness_changed", serde_json::json!({
+                                    "project_id": project_id,
+                                    "file_path": file_path,
+                                    "awareness": awareness,
+                                }))
+                            }
+                            Notification::AnalysisComplete { project_id, file_path, line_count, todo_count } => {
+                                ("analysis_complete", serde_json::json!({
+                                    "project_id": project_id,
+                                    "file_path": file_path,
+                                    "line_count": line_count,
+                                    "todo_count": todo_count,
+                                }))
+                            }
+                            Notification::TreePatch { project_id, patch } => {
+                                ("tree_patch", serde_json::json!({
+                                    "project_id": project_id,
+                                    "patch": patch,
+                                }))
+                            }
+                        };
+
+                        let rpc_notification = serde_json::json!({
                             "jsonrpc": "2.0",
-                            "method": "event",
-                            "params": event
+                            "method": method,
+                            "params": params
                         });
-                        if let Ok(json) = serde_json::to_string(&notification) {
+
+                        if let Ok(json) = serde_json::to_string(&rpc_notification) {
                             if writer.write_all(json.as_bytes()).await.is_err()
                                 || writer.write_all(b"\n").await.is_err()
                             {
-                                debug!("Client {} disconnected during event send", peer_addr);
+                                debug!("Client {} disconnected during notification send", peer_addr);
                                 return;
                             }
                         }
@@ -280,6 +312,7 @@ async fn handle_connection(mut stream: tokio::net::UnixStream, state: Arc<Server
                         project_id = pid.clone();
                         found_receiver = Some(());
                         break;
+                    }
                     }
                 }
             }
@@ -432,6 +465,9 @@ async fn handle_request(
         }
         Method::QueryAgents => {
             handle_query_agents(req, state).await
+        }
+        Method::QueryTree => {
+            handle_query_tree(req, state).await
         }
         Method::Attribute => {
             handle_attribute(req, state).await
@@ -993,6 +1029,55 @@ async fn handle_query_awareness(req: Request, state: &ServerState) -> Response {
     }
 }
 
+/// Handle query_tree request
+///
+/// Expects params: {"project_id": "my-project"}
+/// Returns: TreeNode JSON representation
+async fn handle_query_tree(req: Request, state: &ServerState) -> Response {
+    use crate::protocol::Params;
+
+    // Extract project_id from params
+    let project_id = match &req.params {
+        Some(Params::Object(map)) => {
+            match map.get("project_id") {
+                Some(id) if id.is_string() => id.as_str().unwrap(),
+                _ => {
+                    return Response::error(
+                        req.id,
+                        ProtocolError::invalid_params("project_id is required and must be a string"),
+                    );
+                }
+            }
+        }
+        _ => {
+            return Response::error(
+                req.id,
+                ProtocolError::invalid_params("params object with project_id is required"),
+            );
+        }
+    };
+
+    // Get the tree from state
+    match state.get_tree(project_id).await {
+        Some(tree) => {
+            let root = tree.to_tree_node();
+            match serde_json::to_value(root) {
+                Ok(v) => Response::result(req.id, v),
+                Err(_) => Response::error(
+                    req.id,
+                    ProtocolError::internal_error(),
+                ),
+            }
+        }
+        None => {
+            Response::error(
+                req.id,
+                ProtocolError::project_not_found(project_id.to_string()),
+            )
+        }
+    }
+}
+
 /// Handle attribute request
 ///
 /// Expects params: {"file_path": "src/auth.rs", "project_id": "my-project",
@@ -1098,7 +1183,7 @@ async fn handle_attribute(req: Request, state: &ServerState) -> Response {
     }
 
     // Broadcast to subscribers
-    state.subscriptions.broadcast(event_clone).await;
+    state.subscriptions.publish_event(event_clone).await;
 
     debug!("Attributed file {} to source {}", file_path, source_str);
 
@@ -1949,5 +2034,20 @@ mod tests {
         let mut state = ConnectionState::new();
         let removed = state.remove_subscription("nonexistent");
         assert!(!removed);
+    }
+
+    #[test]
+    fn connection_state_get_receiver() {
+        let mut state = ConnectionState::new();
+        let (tx, rx) = broadcast::channel(1);
+
+        state.add_subscription("proj-1".to_string(), rx);
+
+        // get_receiver returns the receiver for a specific project
+        let receiver = state.get_receiver("proj-1");
+        assert!(receiver.is_some());
+
+        // Non-existent project returns None
+        assert!(state.get_receiver("nonexistent").is_none());
     }
 }
