@@ -277,7 +277,16 @@ impl DaemonServer {
             let shutdown_flag = self.shutdown_requested.clone();
             let mut shutdown_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
 
-            let socket_task = tokio::spawn({
+            // Grab shutdown sender BEFORE spawning socket_task.
+            // socket_task holds the socket_server mutex while running,
+            // so we can't lock it again to call shutdown(). Use the
+            // broadcast channel directly instead.
+            let socket_shutdown_tx = {
+                let socket = self.socket_server.lock().await;
+                socket.shutdown_sender()
+            };
+
+            let mut socket_task = tokio::spawn({
                 let socket_server = self.socket_server.clone();
                 async move {
                     let mut socket = socket_server.lock().await;
@@ -285,26 +294,50 @@ impl DaemonServer {
                 }
             });
 
-            tokio::select! {
-                result = socket_task => result??,
-                _ = sigterm.recv() => {
-                    tracing::info!("SIGTERM received, shutting down");
-                    self.shutdown().await?;
-                }
-                _ = sigint.recv() => {
-                    tracing::info!("SIGINT received, shutting down");
-                    self.shutdown().await?;
-                }
-                _ = shutdown_interval.tick() => {
-                    // Check external shutdown flag (e.g., from Daemon signal handler)
-                    if let Some(flag) = &shutdown_flag {
-                        if flag.load(Ordering::Relaxed) {
-                            tracing::info!("External shutdown flag set, shutting down");
-                            self.shutdown().await?;
+            loop {
+                tokio::select! {
+                    result = &mut socket_task => {
+                        result??;
+                        break;
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received, shutting down");
+                        if let Some(tx) = &socket_shutdown_tx {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!("SIGINT received, shutting down");
+                        if let Some(tx) = &socket_shutdown_tx {
+                            let _ = tx.send(());
+                        }
+                        break;
+                    }
+                    _ = shutdown_interval.tick() => {
+                        if let Some(flag) = &shutdown_flag {
+                            if flag.load(Ordering::Relaxed) {
+                                tracing::info!("External shutdown flag set, shutting down");
+                                if let Some(tx) = &socket_shutdown_tx {
+                                    let _ = tx.send(());
+                                }
+                                break;
+                            }
                         }
                     }
                 }
             }
+
+            // Cleanup after select loop exits
+            {
+                let mut running = self.running.lock().await;
+                *running = false;
+            }
+            {
+                let mut watcher = self.watcher.lock().await;
+                watcher.stop();
+            }
+            tracing::info!("daemon server shut down");
         }
 
         #[cfg(not(unix))]

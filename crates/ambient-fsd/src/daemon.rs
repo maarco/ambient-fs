@@ -207,13 +207,13 @@ impl Daemon {
             return Err(DaemonError::AlreadyRunning(pid));
         }
 
-        // Create PID file before fork
-        self.pid_file.create()?;
-
         // Fork to background (skip in foreground mode)
         if !self.foreground {
             self.fork()?;
         }
+
+        // Create PID file AFTER fork so child PID is recorded
+        self.pid_file.create()?;
 
         // Setup signal handlers
         self.setup_signals();

@@ -81,12 +81,94 @@ enum Command {
     UninstallService,
 }
 
-#[tokio::main]
-async fn main() {
+/// Context from synchronous daemon setup, passed to async runtime.
+struct StartContext {
+    daemon: daemon::Daemon,
+    server_config: server::ServerConfig,
+}
+
+fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Command::Start { foreground } => cmd_start(foreground).await,
+    // Start command: daemonize BEFORE creating tokio runtime.
+    // fork() inside a tokio runtime corrupts kqueue/epoll fds.
+    let start_ctx = if let Command::Start { foreground } = &cli.command {
+        match prepare_start(*foreground) {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create tokio runtime AFTER daemonization
+    let rt = tokio::runtime::Runtime::new()
+        .expect("failed to create tokio runtime");
+
+    let result = rt.block_on(run(cli, start_ctx));
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Synchronous daemon preparation: config, logging, fork, PID, signals, stdio.
+/// Must complete before tokio runtime is created.
+fn prepare_start(foreground: bool) -> Result<StartContext, anyhow::Error> {
+    let daemon_config = config::load()?;
+
+    let log_level = daemon_config.log_level.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level))
+        )
+        .init();
+
+    let daemon = daemon::Daemon::new().with_foreground(foreground);
+
+    if daemon.is_foreground() {
+        tracing::info!("starting daemon in foreground mode");
+    } else {
+        tracing::info!("starting daemon in background mode");
+    }
+
+    // Check if already running
+    match daemon.status() {
+        Ok(Some(pid)) => {
+            println!("daemon already running (PID {})", pid);
+            std::process::exit(0);
+        }
+        Ok(None) => {}
+        Err(daemon::DaemonError::PidFileRead(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Fork + PID file + signal handlers + stdio redirect
+    // ALL synchronous, ALL before tokio runtime creation
+    daemon.start()?;
+
+    let server_config = config::to_server_config(&daemon_config);
+    tracing::info!("daemon started (PID {})", std::process::id());
+
+    Ok(StartContext { daemon, server_config })
+}
+
+/// Async entry point, runs inside tokio runtime.
+async fn run(cli: Cli, start_ctx: Option<StartContext>) -> Result<(), anyhow::Error> {
+    match cli.command {
+        Command::Start { .. } => {
+            let ctx = start_ctx.expect("start context must be set");
+            let server = server::DaemonServer::new(ctx.server_config).await?
+                .with_shutdown_flag(ctx.daemon.shutdown_flag());
+            server.run().await?;
+            let _ = ctx.daemon.remove_pid_file();
+            Ok(())
+        }
         Command::Stop => cmd_stop().await,
         Command::Status => cmd_status().await,
         Command::Watch { path } => cmd_watch(path).await,
@@ -101,72 +183,7 @@ async fn main() {
         Command::Prune { retention_days } => cmd_prune(retention_days).await,
         Command::InstallService => cmd_install_service(),
         Command::UninstallService => cmd_uninstall_service(),
-    };
-
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
     }
-}
-
-async fn cmd_start(foreground: bool) -> Result<(), anyhow::Error> {
-    // Load config (creates default if missing)
-    let daemon_config = config::load()?;
-
-    // Initialize logging
-    let log_level = daemon_config.log_level.clone();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level))
-        )
-        .init();
-
-    let daemon = daemon::Daemon::new().with_foreground(foreground);
-
-    // Log whether we're running in foreground mode
-    if daemon.is_foreground() {
-        tracing::info!("starting daemon in foreground mode");
-    } else {
-        tracing::info!("starting daemon in background mode");
-    }
-
-    // Verify shutdown state before starting
-    if daemon.is_shutdown_requested() {
-        tracing::warn!("shutdown flag already set before start");
-    }
-
-    // Check if already running (ignore PidFileRead errors)
-    let already_running = match daemon.status() {
-        Ok(Some(pid)) => {
-            println!("daemon already running (PID {})", pid);
-            return Ok(());
-        }
-        Ok(None) => false,
-        Err(daemon::DaemonError::PidFileRead(_)) => false,
-        Err(e) => return Err(e.into()),
-    };
-
-    if already_running {
-        return Ok(());
-    }
-
-    // Start daemon (forks, sets up signals, redirects stdio, creates PID file)
-    daemon.start()?;
-
-    // Convert DaemonConfig to ServerConfig
-    let server_config = config::to_server_config(&daemon_config);
-    let server = server::DaemonServer::new(server_config).await?
-        .with_shutdown_flag(daemon.shutdown_flag());
-    println!("daemon started (PID {})", std::process::id());
-
-    // Run server (blocks until shutdown)
-    server.run().await?;
-
-    // Clean up PID file on exit
-    let _ = daemon.remove_pid_file();
-
-    Ok(())
 }
 
 async fn cmd_stop() -> Result<(), anyhow::Error> {
@@ -186,13 +203,11 @@ async fn cmd_stop() -> Result<(), anyhow::Error> {
 
 async fn cmd_status() -> Result<(), anyhow::Error> {
     let daemon = daemon::Daemon::new();
-    match daemon.status()? {
-        Some(pid) => {
-            println!("daemon running (PID {})", pid);
-        }
-        None => {
-            println!("daemon not running");
-        }
+    match daemon.status() {
+        Ok(Some(pid)) => println!("daemon running (PID {})", pid),
+        Ok(None) => println!("daemon not running"),
+        Err(daemon::DaemonError::PidFileRead(_)) => println!("daemon not running"),
+        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
