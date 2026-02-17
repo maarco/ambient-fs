@@ -1,5 +1,6 @@
 mod daemon;
 mod server;
+mod config;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -95,9 +96,16 @@ async fn main() {
 }
 
 async fn cmd_start(foreground: bool) -> Result<(), anyhow::Error> {
+    // Load config (creates default if missing)
+    let daemon_config = config::load()?;
+
     // Initialize logging
+    let log_level = daemon_config.log_level.clone();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level))
+        )
         .init();
 
     let daemon = daemon::Daemon::new().with_foreground(foreground);
@@ -120,9 +128,9 @@ async fn cmd_start(foreground: bool) -> Result<(), anyhow::Error> {
     // Create PID file
     daemon.create_pid_file()?;
 
-    // Start the server
-    let config = server::ServerConfig::default();
-    let server = server::DaemonServer::new(config).await?;
+    // Convert DaemonConfig to ServerConfig
+    let server_config = config::to_server_config(&daemon_config);
+    let server = server::DaemonServer::new(server_config).await?;
     println!("daemon started (PID {})", std::process::id());
 
     // Run server (blocks until shutdown)

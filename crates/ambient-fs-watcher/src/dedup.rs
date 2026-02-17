@@ -20,6 +20,7 @@ pub enum HashError {
 ///
 /// Computes blake3 hashes of file contents to detect duplicate content
 /// across the filesystem. Skips hashing files larger than max_size_bytes.
+#[derive(Debug, Clone, Copy)]
 pub struct ContentDedup {
     /// Maximum file size to hash in bytes
     max_size_bytes: u64,

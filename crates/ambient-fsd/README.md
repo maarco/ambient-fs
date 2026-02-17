@@ -7,10 +7,20 @@ CLI daemon binary for ambient-fs. Watches directories and logs events.
 ### Start Daemon
 
 ```bash
+# Background mode (forks, redirects stdio to /tmp/ambient-fs.log)
 ambient-fsd start
+
+# Foreground mode (stay in terminal, useful for debugging)
+ambient-fsd start --foreground
+# or
+ambient-fsd start -F
 ```
 
 Creates PID file at `/tmp/ambient-fs.pid`, starts the server on `/tmp/ambient-fs.sock`.
+
+In background mode, stdout and stderr are redirected to `/tmp/ambient-fs.log` and stdin is
+redirected from `/dev/null`. In foreground mode (--foreground/-F), stdio remains attached
+to the terminal and no forking occurs.
 
 ### Stop Daemon
 

@@ -15,7 +15,7 @@ Like Facebook's Watchman, but with:
 cargo install ambient-fsd
 
 # Start daemon
-ambient-fsd start
+ambient-fsd start [--foreground]  # --foreground keeps stdio attached (no fork)
 
 # Watch a project
 ambient-fsd watch /path/to/project
@@ -46,7 +46,7 @@ ambient-fsd (daemon)
 - **ambient-fs-store** - SQLite event store with WAL mode
 - **ambient-fs-watcher** - Filesystem watching with notify 8, debouncing, blake3 dedup
 - **ambient-fs-analyzer** - Content analysis (TODOs, imports, line counts)
-- **ambient-fs-server** - Unix socket server with JSON-RPC protocol
+- **ambient-fs-server** - Unix socket server with JSON-RPC protocol, LLM client
 - **ambient-fsd** - CLI daemon binary
 - **ambient-fs-client** - Rust client library
 

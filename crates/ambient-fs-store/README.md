@@ -10,6 +10,12 @@ SQLite event store for ambient-fs. Append-only event log with WAL mode for concu
   - `query(filter)` - Query with filters (project, source, since, limit)
   - `get_latest(project, path)` - Most recent event for a file
 
+- **Project CRUD** - Manage watched projects
+  - `add_project(project_id, path)` - Register a project
+  - `remove_project(project_id)` - Unregister a project
+  - `get_project_path(project_id)` - Get path for a project
+  - `list_projects()` - List all registered projects
+
 - **FileAnalysisCache** - Cache analysis results
   - `get(project, path)` - Retrieve cached analysis
   - `put(analysis)` - Store analysis result
@@ -37,6 +43,12 @@ CREATE TABLE file_events (
     content_hash TEXT
 );
 
+CREATE TABLE projects (
+    project_id TEXT PRIMARY KEY,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE file_analysis (
     file_path TEXT NOT NULL,
     project_id TEXT NOT NULL,
@@ -54,11 +66,19 @@ CREATE TABLE file_analysis (
 
 ```rust
 use ambient_fs_store::EventStore;
+use std::path::PathBuf;
 
 let store = EventStore::new("/path/to/events.db")?;
 
+// Store events
 store.insert(&event)?;
 let events = store.query(EventFilter::new().project_id("my-project"))?;
+
+// Manage projects
+store.add_project("my-project", &PathBuf::from("/path/to/project"))?;
+let path = store.get_project_path("my-project")?;
+let all_projects = store.list_projects()?;
+store.remove_project("my-project")?;
 ```
 
 ## License

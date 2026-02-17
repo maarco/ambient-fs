@@ -108,6 +108,15 @@ max_concurrent = 2                     # background analysis threads
 max_file_size_bytes = 1_048_576        # skip analysis for files > 1MB
 languages = ["typescript", "javascript", "rust", "python", "vue", "markdown"]
 
+[llm]
+enabled = false                        # haiku-class LLM enhancement (optional)
+api_key = ""                           # ANTHROPIC_API_KEY env var recommended
+model = "claude-haiku-4-5-20251001"    # haiku for fast, cheap analysis
+base_url = "https://api.anthropic.com/v1"
+max_tokens = 512
+max_file_size_bytes = 51_200           # skip files > 50KB for LLM analysis
+batch_delay_ms = 2000                  # collect files then send in batches
+
 [sync]
 enabled = false                        # future: remote sync
 machine_id = ""                        # auto-generated on first run
@@ -161,6 +170,8 @@ ambient-fs/                            workspace root (standalone repo)
         grpc.rs                        gRPC server (tonic)
         protocol.rs                    request/response types
         subscriptions.rs               live event subscriptions
+        llm.rs                         LLM client for haiku-class API calls
+                                      (shared between analyzer and agent tracker)
 
     ambient-fsd/                       daemon binary
       src/
@@ -605,12 +616,15 @@ Sync protocol:
 
 ### Phase 2: Content Analysis
 
-**P2-1: Integrate ast-grep-core**
-- ambient-fs-analyzer crate
-- FileAnalyzer trait: analyze(path) -> FileAnalysis
-- tree-sitter parsing for: TS, JS, Rust, Python, Vue, Markdown
-- Extract: exports, imports, TODOs, lint hints, line count
-- Priority: P2
+**P2-1: LLM-powered content analysis**
+- ambient-fs-analyzer crate (COMPLETE 2026-02-16)
+- Two-tier analysis:
+  - Tier 1 (local): line count, TODO/FIXME/HACK count (always runs)
+  - Tier 2 (LLM): imports, exports, lint hints (optional, async)
+- LlmFileAnalyzer: builds prompts, parses JSON responses, merges results
+- FileAnalyzer: analyze() returns tier 1 immediately, enhance_with_llm_response() for tier 2
+- Single Haiku API call per file returns all three: imports, exports, lint_hints
+- Priority: P2 (done)
 
 **P2-2: Create analysis cache**
 - file_analysis table in events.db
@@ -645,12 +659,22 @@ Sync protocol:
 - get_awareness(project, path) -> FileAwareness
 - get_project_awareness(project) -> Map<path, FileAwareness>
 - Serve via Unix socket + gRPC
-- Priority: P2
+- DONE: query_awareness handler implemented (2026-02-16)
+- Priority: P2 (done)
 
 **P3-3: Add awareness subscription**
 - Clients subscribe to awareness changes for a project
 - Server pushes FileAwareness diffs (only changed files)
 - Priority: P2
+
+**P3-4: Agent activity tracking (NEW 2026-02-16)**
+- DONE: AgentTracker module for passive agent monitoring via JSONL
+- DONE: watch_agents, unwatch_agents, query_agents JSON-RPC methods
+- DONE: ServerState.agent_tracker with 5-minute stale timeout
+- DONE: AgentActivity struct parses JSONL activity lines
+- DONE: AgentState tracks per-agent files, intent, tool, session
+- Priority: P2 (done)
+- See: docs/spec/missing/agent-activity-protocol.md
 
 ---
 
@@ -810,3 +834,91 @@ Parallelism opportunities:
 
 5. Naming: ambient-fs vs something catchier for the open-source
    release?
+
+
+## LLM Integration
+
+The daemon includes an optional LLM client for enhanced analysis using
+haiku-class models. This is used for:
+
+1. **File Analysis** (ambient-fs-analyzer): Extract imports, exports, and
+   lint hints in a single API call per file.
+2. **Agent Activity Parsing** (ambient-fs-server): Enhance non-conforming
+   agent JSONL logs to extract structured activity data.
+
+### LlmClient API
+
+```rust
+use ambient_fs_server::{LlmClient, LlmConfig, LlmError};
+
+// Configure with API key (from env var recommended)
+let config = LlmConfig {
+    api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+    model: "claude-haiku-4-5-20251001".to_string(),
+    ..Default::default()
+};
+
+let client = LlmClient::new(config);
+
+if client.is_enabled() {
+    // Raw text response
+    let response = client.call(
+        "you analyze source code. respond with JSON only.",
+        &format!("language: rust\nfile: src/main.rs\n{}", code)
+    ).await?;
+
+    // Structured JSON response (for analysis results)
+    #[derive(Deserialize)]
+    struct CodeAnalysis {
+        imports: Vec<ImportRef>,
+        exports: Vec<String>,
+        lint_hints: Vec<LintHint>,
+    }
+
+    let analysis: CodeAnalysis = client.call_json(
+        "extract imports, exports, and lint hints as JSON",
+        code
+    ).await?;
+}
+```
+
+### Error Handling
+
+```rust
+match client.call(system, user).await {
+    Ok(text) => println!("LLM response: {}", text),
+    Err(LlmError::Disabled) => {
+        // No API key configured - expected in default setup
+    }
+    Err(LlmError::Api { status, message }) => {
+        eprintln!("API error {}: {}", status, message);
+    }
+    Err(LlmError::Http(e)) => {
+        eprintln!("Network error: {}", e);
+    }
+    Err(LlmError::Parse(e)) => {
+        eprintln!("Failed to parse response as JSON: {}", e);
+    }
+}
+```
+
+### Cost Estimates
+
+Haiku pricing (as of Feb 2026):
+- Input: $0.25/M tokens
+- Output: $1.25/M tokens
+
+Typical file analysis:
+- Input: ~300-500 tokens (code + prompt)
+- Output: ~100-200 tokens (structured JSON)
+- Cost: ~$0.0001 per file
+- At 100 file changes/hour: ~$0.01/hour
+
+Agent activity enhancement:
+- Input: ~200 tokens per batch
+- Output: ~50 tokens per batch
+- Cost: ~$0.0001 per batch
+
+The LLM is **optional and disabled by default**. When disabled,
+all tier-1 analysis (line counts, TODO counting) still works locally.
+Only tier-2 analysis (imports, exports, lint hints) requires the LLM.

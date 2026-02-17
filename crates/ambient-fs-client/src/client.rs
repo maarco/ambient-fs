@@ -1,4 +1,4 @@
-use ambient_fs_core::FileEvent;
+use ambient_fs_core::{awareness::FileAwareness, FileEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use std::path::PathBuf;
@@ -116,6 +116,76 @@ impl AmbientFsClient {
         let params = json!({ "project_id": project_id });
         self.send_request("subscribe", &params).await?;
         Ok(())
+    }
+
+    // ===== protocol methods matching server =====
+
+    /// Watch a project directory and get its project_id
+    pub async fn watch_project(&mut self, path: &str) -> Result<String> {
+        let params = json!({ "path": path });
+        let response = self.send_request("watch_project", &params).await?;
+        serde_json::from_value(response)
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    /// Unwatch a project by ID
+    pub async fn unwatch_project(&mut self, project_id: &str) -> Result<()> {
+        let params = json!({ "project_id": project_id });
+        self.send_request("unwatch_project", &params).await?;
+        Ok(())
+    }
+
+    /// Unsubscribe from project notifications
+    pub async fn unsubscribe(&mut self, project_id: &str) -> Result<()> {
+        let params = json!({ "project_id": project_id });
+        self.send_request("unsubscribe", &params).await?;
+        Ok(())
+    }
+
+    /// Query events with filter (renamed from events)
+    pub async fn query_events(&mut self, filter: EventFilter) -> Result<Vec<FileEvent>> {
+        let response = self.send_request("query_events", &filter).await?;
+        serde_json::from_value(response)
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    /// Query awareness for a file in a project
+    pub async fn query_awareness(&mut self, project_id: &str, path: &str) -> Result<FileAwareness> {
+        let params = json!({
+            "project_id": project_id,
+            "path": path,
+        });
+        let response = self.send_request("query_awareness", &params).await?;
+        serde_json::from_value(response)
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    /// Attribute a file change to a specific source
+    pub async fn attribute(
+        &mut self,
+        project_id: &str,
+        file_path: &str,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> Result<()> {
+        let mut params = json!({
+            "project_id": project_id,
+            "file_path": file_path,
+            "source": source,
+        });
+        if let Some(sid) = source_id {
+            params["source_id"] = json!(sid);
+        }
+        self.send_request("attribute", &params).await?;
+        Ok(())
+    }
+
+    /// Query active agents (returns generic JSON since AgentInfo not defined yet)
+    pub async fn query_agents(&mut self) -> Result<Vec<serde_json::Value>> {
+        let empty = json!({});
+        let response = self.send_request("query_agents", &empty).await?;
+        serde_json::from_value(response)
+            .map_err(|_| ClientError::InvalidResponse)
     }
 
     /// Send a JSON-RPC request and get the response
@@ -340,5 +410,196 @@ mod tests {
 
         let err = ClientError::DaemonError("something broke".to_string());
         assert_eq!(err.to_string(), "daemon returned error: something broke");
+    }
+
+    // ===== new protocol method tests =====
+
+    #[tokio::test]
+    async fn watch_project_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.watch_project("/home/user/project").await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn unwatch_project_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.unwatch_project("proj-123").await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.unsubscribe("proj-123").await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn query_events_same_as_events() {
+        // query_events is renamed from events, should have same behavior
+        let filter = EventFilter {
+            project_id: Some("my-project".to_string()),
+            since: Some(1708100000),
+            source: Some("ai_agent".to_string()),
+            limit: Some(100),
+        };
+
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.query_events(filter).await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn query_awareness_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.query_awareness("proj-123", "src/main.rs").await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn query_agents_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.query_agents().await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn attribute_request_format() {
+        let mut client = AmbientFsClient {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            stream: None,
+            next_id: 1,
+        };
+
+        let result = client.attribute("my-project", "src/auth.rs", "ai_agent", Some("chat-42")).await;
+        assert!(matches!(result, Err(ClientError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn attribute_request_serialization() {
+        let params = json!({
+            "project_id": "my-project",
+            "file_path": "src/auth.rs",
+            "source": "ai_agent",
+            "source_id": "chat-42"
+        });
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("my-project"));
+        assert!(json.contains("src/auth.rs"));
+        assert!(json.contains("ai_agent"));
+        assert!(json.contains("chat-42"));
+    }
+
+    #[tokio::test]
+    async fn attribute_request_without_source_id() {
+        let params = json!({
+            "project_id": "my-project",
+            "file_path": "src/auth.rs",
+            "source": "user"
+        });
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("user"));
+        // source_id should not be present when None
+        assert!(!json.contains("source_id"));
+    }
+
+    #[tokio::test]
+    async fn watch_project_response_parsing() {
+        let response_json = r#"{
+            "jsonrpc":"2.0",
+            "result":"proj-abc-123",
+            "id":1
+        }"#;
+
+        let response: JsonRpcResponse = serde_json::from_str(response_json).unwrap();
+        match response.payload {
+            ResponsePayload::Success { result } => {
+                let project_id: String = serde_json::from_value(result).unwrap();
+                assert_eq!(project_id, "proj-abc-123");
+            }
+            ResponsePayload::Error { .. } => panic!("expected success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_awareness_response_parsing() {
+        let awareness_json = r#"{
+            "jsonrpc":"2.0",
+            "result":{
+                "file_path":"src/main.rs",
+                "project_id":"proj-123",
+                "last_modified":"2024-02-16T10:32:00Z",
+                "change_frequency":"hot",
+                "modified_by":"ai_agent",
+                "todo_count":0,
+                "chat_references":0,
+                "lint_hints":0,
+                "line_count":100
+            },
+            "id":1
+        }"#;
+
+        let response: JsonRpcResponse = serde_json::from_str(awareness_json).unwrap();
+        match response.payload {
+            ResponsePayload::Success { result } => {
+                let awareness: FileAwareness = serde_json::from_value(result).unwrap();
+                assert_eq!(awareness.file_path, "src/main.rs");
+                assert_eq!(awareness.modified_by, ambient_fs_core::Source::AiAgent);
+            }
+            ResponsePayload::Error { .. } => panic!("expected success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_agents_response_parsing() {
+        let agents_json = r#"{
+            "jsonrpc":"2.0",
+            "result":[
+                {"id":"agent-1","name":"claude","status":"active"},
+                {"id":"agent-2","name":"cursor","status":"idle"}
+            ],
+            "id":1
+        }"#;
+
+        let response: JsonRpcResponse = serde_json::from_str(agents_json).unwrap();
+        match response.payload {
+            ResponsePayload::Success { result } => {
+                let agents: Vec<serde_json::Value> = serde_json::from_value(result).unwrap();
+                assert_eq!(agents.len(), 2);
+                assert_eq!(agents[0]["name"], "claude");
+            }
+            ResponsePayload::Error { .. } => panic!("expected success"),
+        }
     }
 }

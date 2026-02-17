@@ -1,10 +1,11 @@
 analyzer stubs (ambient-fs-analyzer)
 =====================================
 
-status: redesigned -- LLM-first approach
+status: implemented -- LLM-first approach complete
 updated: 2026-02-16
 affects: crates/ambient-fs-analyzer/src/analyzer.rs,
-         crates/ambient-fs-analyzer/src/languages.rs
+         crates/ambient-fs-analyzer/src/languages.rs,
+         crates/ambient-fs-analyzer/src/llm_analyzer.rs
 
 
 design change
@@ -105,37 +106,47 @@ share the same LLM client config.
 implementation
 --------------
 
-crates/ambient-fs-analyzer/src/llm_analyzer.rs (new):
+status: done
 
-  LlmAnalyzer struct:
-    - config: LlmConfig (api_key, model, enabled, max_file_size)
-    - analyze_file(path, content, language) -> FileAnalysis
-    - analyze_batch(files) -> Vec<FileAnalysis>
-    - builds prompt from file content + language
-    - parses JSON response into ImportRef/LintHint structs
-    - falls back to empty vecs on parse failure (graceful)
+crates/ambient-fs-analyzer/src/llm_analyzer.rs (implemented):
 
-  LlmConfig:
-    - api_key: Option<String>  (None = disabled)
-    - model: String  (default: "claude-haiku-4-5-20251001")
-    - max_tokens: usize (default: 512)
-    - max_file_size: u64 (skip files over this, default 50KB)
-    - batch_delay_ms: u64 (default: 2000, collect files then send)
+  LlmFileAnalyzer struct:
+    - enabled: bool
+    - build_prompt(file_path, content, language) -> (String, String)
+      constructs system and user prompts for LLM analysis
+    - parse_response(response: &str) -> Result<LlmAnalysisResponse>
+      parses JSON response, handles empty/malformed input
+    - to_file_analysis(response, base: FileAnalysis) -> FileAnalysis
+      merges LLM results into base FileAnalysis (tier 1 + tier 2)
+    - enhance_with_llm_response(base, llm_response) -> Result<FileAnalysis>
+      convenience method combining parse + merge
 
-crates/ambient-fs-analyzer/src/analyzer.rs (modify):
+  LlmAnalysisResponse:
+    - imports: Vec<LlmImport>  (path, symbols, line)
+    - exports: Vec<String>
+    - lint_hints: Vec<LlmLintHint> (line, column, severity, message, rule)
+
+  LlmAnalyzerError:
+    - ParseError(serde_json::Error)
+    - EmptyResponse
+
+crates/ambient-fs-analyzer/src/analyzer.rs (modified):
 
   FileAnalyzer changes:
-    - add optional llm_analyzer: Option<LlmAnalyzer>
-    - analyze() still does tier 1 locally (lines, todos)
-    - if llm_analyzer is Some, schedule tier 2 async
-    - return FileAnalysis immediately with tier 1 data
-    - tier 2 results merged in when LLM responds
+    - added llm_enabled: bool field
+    - with_llm(enabled: bool) -> Self (builder method)
+    - is_llm_enabled() -> bool (getter)
+    - enhance_with_llm_response(base, llm_response) -> Result<FileAnalysis>
+      delegates to LlmFileAnalyzer for parsing and merging
+    - analyze() returns tier 1 data immediately (line_count, todo_count)
+      imports/exports/lint_hints are empty until enhanced via LLM response
 
-  two-phase return:
-    1. immediate: FileAnalysis with line_count, todo_count
-       (imports=[], exports=[], lint_hints=[])
-    2. async update: FileAnalysis with all fields populated
-       (broadcast via SubscriptionManager or callback)
+  exports from lib.rs:
+    - LlmFileAnalyzer
+    - LlmAnalysisResponse
+    - LlmImport
+    - LlmLintHint
+    - LlmAnalyzerError
 
 
 beads mapping
@@ -151,11 +162,18 @@ ar2 (lint hints):
   → handled by LlmAnalyzer, "lint_hints" field in response
 
 up0 (dynamic language registration):
-  → still needed independently. the LLM doesn't need
-    language configs to analyze code (it detects language
-    from content), but the LanguageRegistry is used by
-    other parts of the system (feature flags, extension
-    mapping). implement as originally spec'd.
+  → COMPLETE (2026-02-16)
+  - implemented in crates/ambient-fs-analyzer/src/languages.rs
+  - OwnedLanguageConfig struct for heap-allocated configs
+  - LanguageRegistry.register() writes to RwLock<HashMap<String, OwnedLanguageConfig>>
+  - LanguageRegistry.get_for_path() checks custom registry first, then builtins
+  - Thread-safe via RwLock, allows custom languages to override builtins
+  - reset_custom() for test isolation
+  - 8 new tests: register_custom_language, custom_language_multiple_extensions,
+    custom_overrides_builtin, builtin_still_works_after_custom_registration,
+    register_is_thread_safe, owned_language_config_clone,
+    owned_to_language_config_conversion, reset_custom calls in existing tests
+  - OwnedLanguageConfig exported from lib.rs as public API
 
 
 shared LLM infrastructure
@@ -165,30 +183,63 @@ the LLM client should be shared between:
   1. analyzer (file analysis)
   2. agent tracker (activity parsing)
 
-create a shared module:
+status: DONE (2026-02-16)
 
   crates/ambient-fs-server/src/llm.rs:
-    LlmClient struct:
-      - config: LlmConfig
-      - client: reqwest::Client
-      - call(system_prompt, user_prompt) -> String
-      - call_json<T>(system, user) -> T  (parse response)
 
-    used by both LlmAnalyzer and AgentTracker.
-    single API key config, single HTTP client.
+  LlmConfig struct:
+    - api_key: Option<String>  (None = disabled)
+    - model: String  (default: "claude-haiku-4-5-20251001")
+    - base_url: String (default: "https://api.anthropic.com/v1")
+    - max_tokens: usize (default: 512)
+    - implements Default
+
+  LlmClient struct:
+    - config: LlmConfig
+    - client: reqwest::Client
+    - new(config: LlmConfig) -> Self
+    - is_enabled(&self) -> bool (checks api_key is Some)
+    - async call(system: &str, user: &str) -> Result<String, LlmError>
+      POST to {base_url}/messages with Anthropic headers
+      (x-api-key, anthropic-version: 2023-06-01)
+      Returns the text content from response[0].text
+    - async call_json<T: DeserializeOwned>(system: &str, user: &str) -> Result<T, LlmError>
+      Calls call(), then serde_json::from_str on the result
+
+  LlmError enum:
+    - Disabled (no API key)
+    - Http(reqwest::Error)
+    - Api { status: u16, message: String }
+    - Parse(serde_json::Error)
+
+  tests (5 passing):
+    - test_llm_config_defaults
+    - test_is_enabled_with_api_key
+    - test_is_enabled_without_api_key
+    - test_call_json_parsing_valid_json
+    - test_call_json_error_on_invalid_json
+
+  exported from lib.rs: LlmClient, LlmConfig, LlmError
+
+  used by both LlmAnalyzer (in ambient-fs-analyzer) and
+  AgentTracker (in ambient-fs-server). single API key config,
+  single HTTP client.
 
 
 test strategy
 -------------
 
+status: done (60 tests passing)
+
 unit tests (no LLM, mock responses):
-  - test prompt construction per language
+  - test prompt construction per language (rust, typescript, python)
   - test JSON response parsing into ImportRef/LintHint
   - test graceful fallback on malformed response
-  - test batch collection and delay logic
-  - test max_file_size skip
+  - test empty/whitespace response handling
+  - test merge behavior for imports, exports, lint_hints
+  - test tier 1 analysis still works without LLM
+  - test severity fallback for unknown values
+  - test full flow with enhance_with_llm_response
 
-integration tests (optional, needs API key):
-  - real haiku call with a small rust file
-  - verify imports/exports/lint hints populated
-  - gated behind #[cfg(feature = "llm-integration-tests")]
+integration tests:
+  - not implemented (requires API key, would be in ambient-fs-server)

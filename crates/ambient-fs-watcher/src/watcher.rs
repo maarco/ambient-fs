@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use ambient_fs_core::{event::FileEvent, event::EventType, filter::PathFilter};
+use ambient_fs_core::{event::FileEvent, event::EventType, event::Source, filter::PathFilter};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
+
+use crate::{ContentDedup, EventAttributor};
 
 pub type EventReceiver = mpsc::UnboundedReceiver<FileEvent>;
 
@@ -53,6 +56,9 @@ pub struct FsWatcher {
     path_filter: PathFilter,
     project_id: String,
     machine_id: String,
+    content_dedup: Option<ContentDedup>,
+    attributor: Option<Arc<Mutex<EventAttributor>>>,
+    project_root: Option<PathBuf>,
 }
 
 impl FsWatcher {
@@ -75,6 +81,9 @@ impl FsWatcher {
             path_filter: PathFilter::default(),
             project_id,
             machine_id,
+            content_dedup: None,
+            attributor: None,
+            project_root: None,
         }
     }
 
@@ -87,6 +96,21 @@ impl FsWatcher {
     /// Replace the current PathFilter
     pub fn set_path_filter(&mut self, filter: PathFilter) {
         self.path_filter = filter;
+    }
+
+    /// Set the content deduplicator for hashing file contents
+    pub fn with_content_dedup(mut self, dedup: ContentDedup) -> Self {
+        self.content_dedup = Some(dedup);
+        self
+    }
+
+    /// Set the event attributor for detecting event sources
+    ///
+    /// The project_root is used for git detection (checking .git/index mtime).
+    pub fn with_attributor(mut self, attributor: EventAttributor, project_root: PathBuf) -> Self {
+        self.attributor = Some(Arc::new(Mutex::new(attributor)));
+        self.project_root = Some(project_root);
+        self
     }
 
     /// Start watching and return the event receiver
@@ -185,6 +209,11 @@ impl FsWatcher {
         let path_filter = self.path_filter.clone();
         let project_id = self.project_id.clone();
         let machine_id = self.machine_id.clone();
+        let content_dedup = self.content_dedup; // ContentDedup is Copy, can move
+
+        // Clone Arc/Mutex for shared state in callback
+        let attributor = self.attributor.clone();
+        let project_root = self.project_root.clone();
 
         let handle_events = move |res: Result<notify::Event, notify::Error>| {
             let event = match res {
@@ -210,12 +239,31 @@ impl FsWatcher {
                     _ => continue,
                 };
 
-                let file_event = FileEvent::new(
+                let mut file_event = FileEvent::new(
                     event_type,
-                    path_str,
+                    path_str.clone(),
                     project_id.clone(),
                     machine_id.clone(),
                 );
+
+                // Apply source attribution if configured
+                if let (Some(ref attr_mutex), Some(ref proj_root)) = (&attributor, &project_root) {
+                    if let Ok(mut attr) = attr_mutex.lock() {
+                        let source = attr.detect_source(&path, proj_root);
+                        file_event = file_event.with_source(source);
+                    }
+                }
+
+                // Apply content hash if configured and event is not Delete
+                if let Some(dedup) = content_dedup {
+                    if matches!(event_type, EventType::Created | EventType::Modified) {
+                        if let Ok(hash) = dedup.hash_file(&path) {
+                            file_event = file_event.with_content_hash(hash);
+                        }
+                        // If hash fails (too large, permissions), we just emit without hash
+                    }
+                    // Deleted events get no hash (file is gone)
+                }
 
                 let _ = tx.send(file_event);
             }
@@ -228,6 +276,9 @@ impl FsWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[test]
@@ -388,5 +439,304 @@ mod tests {
 
         watcher.stop(); // should not panic, watcher is None
         assert!(watcher.watched_paths().is_empty());
+    }
+
+    // ContentDedup integration tests
+
+    #[test]
+    fn with_content_dedup_stores_dedup() {
+        let dedup = ContentDedup::new(1024);
+        let watcher = FsWatcher::new(100, "proj", "machine").with_content_dedup(dedup);
+        assert!(watcher.content_dedup.is_some());
+    }
+
+    #[test]
+    fn watcher_without_dedup_has_none() {
+        let watcher = FsWatcher::new(100, "proj", "machine");
+        assert!(watcher.content_dedup.is_none());
+    }
+
+    #[test]
+    fn watcher_with_dedup_emits_hash_on_create() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_content_dedup(ContentDedup::new(1024));
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        // Create a file
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path).unwrap().write_all(b"hello world").unwrap();
+
+        // Wait for event
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, EventType::Created);
+        assert!(event.content_hash.is_some());
+        assert_eq!(event.content_hash.unwrap().len(), 64); // blake3 hex
+    }
+
+    #[test]
+    fn watcher_with_dedup_emits_hash_on_modify() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path).unwrap().write_all(b"initial").unwrap();
+
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_content_dedup(ContentDedup::new(1024));
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        // Drain initial Create event
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = rx.try_recv();
+
+        // Modify the file
+        fs::write(&file_path, b"modified content").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // May get multiple events, find the Modify one
+        let mut found_modify = false;
+        for _ in 0..10 {
+            if let Ok(event) = rx.try_recv() {
+                if event.event_type == EventType::Modified {
+                    assert!(event.content_hash.is_some());
+                    found_modify = true;
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(found_modify, "No Modify event found");
+    }
+
+    #[test]
+    fn watcher_with_dedup_skips_hash_on_delete() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path).unwrap().write_all(b"content").unwrap();
+
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_content_dedup(ContentDedup::new(1024));
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        // Drain initial Create event
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = rx.try_recv();
+
+        // Delete the file
+        fs::remove_file(&file_path).unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Find the Delete event
+        let mut found_delete = false;
+        for _ in 0..10 {
+            if let Ok(event) = rx.try_recv() {
+                if event.event_type == EventType::Deleted {
+                    assert!(event.content_hash.is_none());
+                    found_delete = true;
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(found_delete, "No Delete event found");
+    }
+
+    #[test]
+    fn watcher_with_dedup_skips_hash_for_large_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_content_dedup(ContentDedup::new(100)); // max 100 bytes
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        // Create a file larger than max_size
+        let file_path = temp_dir.path().join("large.txt");
+        let large_content = vec![b'x'; 200];
+        File::create(&file_path).unwrap().write_all(&large_content).unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, EventType::Created);
+        assert!(event.content_hash.is_none()); // Too large, no hash
+    }
+
+    #[test]
+    fn watcher_without_dedup_emits_no_hash() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine");
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = temp_dir.path().join("test.txt");
+        File::create(&file_path).unwrap().write_all(b"hello").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.event_type, EventType::Created);
+        assert!(event.content_hash.is_none());
+    }
+
+    // EventAttributor integration tests
+
+    #[test]
+    fn with_attributor_stores_attributor() {
+        let attributor = EventAttributor::new();
+        let temp = TempDir::new().unwrap();
+        let watcher = FsWatcher::new(100, "proj", "machine")
+            .with_attributor(attributor, temp.path().to_path_buf());
+        assert!(watcher.attributor.is_some());
+        assert!(watcher.project_root.is_some());
+    }
+
+    #[test]
+    fn watcher_without_attributor_defaults_to_user() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine");
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = temp_dir.path().join("src.txt");
+        File::create(&file_path).unwrap().write_all(b"content").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.source, Source::User);
+    }
+
+    #[test]
+    fn watcher_with_attributor_detects_build_source() {
+        let temp_dir = TempDir::new().unwrap();
+        // Use custom filter that allows build directories for testing
+        let filter = PathFilter::new(vec!["node_modules".to_string(), ".git".to_string()], 10 * 1024 * 1024);
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_path_filter(filter)
+            .with_attributor(EventAttributor::new(), temp_dir.path().to_path_buf());
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        // Create a build artifact
+        fs::create_dir_all(temp_dir.path().join("dist")).unwrap();
+        let file_path = temp_dir.path().join("dist").join("app.js");
+        File::create(&file_path).unwrap().write_all(b"bundle").unwrap();
+
+        // Wait for event with retry
+        let mut found = false;
+        for _ in 0..20 {
+            if let Ok(event) = rx.try_recv() {
+                assert_eq!(event.source, Source::Build);
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(found, "No event received");
+    }
+
+    #[test]
+    fn watcher_with_attributor_detects_user_source() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_attributor(EventAttributor::new(), temp_dir.path().to_path_buf());
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+        let file_path = temp_dir.path().join("src").join("main.rs");
+        File::create(&file_path).unwrap().write_all(b"fn main() {}").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.source, Source::User);
+    }
+
+    #[test]
+    fn watcher_with_explicit_source_overrides() {
+        let temp_dir = TempDir::new().unwrap();
+        let attributor = EventAttributor::new().with_explicit_source(Source::AiAgent);
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_attributor(attributor, temp_dir.path().to_path_buf());
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = temp_dir.path().join("any.txt");
+        File::create(&file_path).unwrap().write_all(b"content").unwrap();
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.source, Source::AiAgent);
+    }
+
+    // Combined dedup + attributor tests
+
+    #[test]
+    fn watcher_with_both_dedup_and_attributor() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_content_dedup(ContentDedup::new(1024))
+            .with_attributor(EventAttributor::new(), temp_dir.path().to_path_buf());
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = temp_dir.path().join("code").join("lib.rs");
+        fs::create_dir_all(temp_dir.path().join("code")).unwrap();
+        File::create(&file_path).unwrap().write_all(b"pub fn hello() {}").unwrap();
+        fs::File::create(&file_path).unwrap().sync_all().unwrap(); // Ensure content is flushed
+
+        // Wait for event with retry
+        let mut found = false;
+        for _ in 0..30 {
+            if let Ok(event) = rx.try_recv() {
+                assert_eq!(event.event_type, EventType::Created);
+                assert_eq!(event.source, Source::User);
+                assert!(event.content_hash.is_some(), "content_hash should be Some");
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(found, "No event received");
+    }
+
+    #[test]
+    fn watcher_with_both_detects_build_and_hashes() {
+        let temp_dir = TempDir::new().unwrap();
+        // Use custom filter that allows build directories for testing
+        let filter = PathFilter::new(vec!["node_modules".to_string(), ".git".to_string()], 10 * 1024 * 1024);
+        let mut watcher = FsWatcher::new(10, "proj", "machine")
+            .with_path_filter(filter)
+            .with_content_dedup(ContentDedup::new(1024))
+            .with_attributor(EventAttributor::new(), temp_dir.path().to_path_buf());
+        let mut rx = watcher.start().unwrap();
+        watcher.watch(temp_dir.path().to_path_buf()).unwrap();
+
+        let file_path = temp_dir.path().join("dist").join("bundle.o");
+        fs::create_dir_all(temp_dir.path().join("dist")).unwrap();
+        File::create(&file_path).unwrap().write_all(b"object bytes").unwrap();
+
+        // Wait for event with retry
+        let mut found = false;
+        for _ in 0..20 {
+            if let Ok(event) = rx.try_recv() {
+                assert_eq!(event.source, Source::Build);
+                assert!(event.content_hash.is_some());
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(found, "No event received");
     }
 }

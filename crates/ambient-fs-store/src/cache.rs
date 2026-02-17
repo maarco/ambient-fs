@@ -83,6 +83,61 @@ impl FileAnalysisCache {
         }
     }
 
+    /// Get cached analysis only if content_hash matches current_hash
+    /// Returns None if file not found or hash differs (stale cache)
+    pub fn get_if_fresh(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        current_hash: &str,
+    ) -> SqliteResult<Option<FileAnalysis>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, project_id, content_hash, exports, imports,
+                    todo_count, lint_hints, line_count
+             FROM file_analysis
+             WHERE project_id = ? AND file_path = ? AND content_hash = ?",
+        )?;
+
+        let mut rows = stmt.query(params![project_id, file_path, current_hash])?;
+
+        if let Some(row) = rows.next()? {
+            let exports_json: String = row.get(3)?;
+            let imports_json: String = row.get(4)?;
+            let lint_hints_json: String = row.get(6)?;
+
+            Ok(Some(FileAnalysis {
+                file_path: row.get(0)?,
+                project_id: row.get(1)?,
+                content_hash: row.get(2)?,
+                exports: serde_json::from_str(&exports_json).unwrap_or_default(),
+                imports: serde_json::from_str(&imports_json).unwrap_or_default(),
+                todo_count: row.get(5)?,
+                lint_hints: serde_json::from_str(&lint_hints_json).unwrap_or_default(),
+                line_count: row.get(7)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Quick check if cached analysis is still fresh (hash matches)
+    /// Returns false if file not found or hash differs
+    pub fn is_fresh(
+        &self,
+        project_id: &str,
+        file_path: &str,
+        hash: &str,
+    ) -> SqliteResult<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 1 FROM file_analysis
+             WHERE project_id = ? AND file_path = ? AND content_hash = ?
+             LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query(params![project_id, file_path, hash])?;
+        Ok(rows.next()?.is_some())
+    }
+
     /// Store analysis result in cache (upsert by project_id + file_path)
     pub fn put(&self, analysis: &FileAnalysis) -> SqliteResult<()> {
         let exports_json = serde_json::to_string(&analysis.exports).unwrap_or_default();
@@ -345,5 +400,74 @@ mod tests {
         assert_eq!(analysis.todo_count, retrieved.todo_count);
         assert_eq!(analysis.lint_hints, retrieved.lint_hints);
         assert_eq!(analysis.line_count, retrieved.line_count);
+    }
+
+    #[test]
+    fn cache_get_if_fresh_matching_hash_returns_analysis() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let analysis = make_test_analysis("src/lib.rs", "hash-abc");
+
+        cache.put(&analysis).unwrap();
+        let retrieved = cache.get_if_fresh("test-project", "src/lib.rs", "hash-abc").unwrap();
+
+        assert_eq!(Some(analysis), retrieved);
+    }
+
+    #[test]
+    fn cache_get_if_fresh_mismatched_hash_returns_none() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let analysis = make_test_analysis("src/lib.rs", "hash-abc");
+
+        cache.put(&analysis).unwrap();
+        let retrieved = cache.get_if_fresh("test-project", "src/lib.rs", "hash-xyz").unwrap();
+
+        assert_eq!(None, retrieved);
+    }
+
+    #[test]
+    fn cache_get_if_fresh_missing_file_returns_none() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let result = cache.get_if_fresh("test-project", "nonexistent.rs", "any-hash").unwrap();
+        assert_eq!(None, result);
+    }
+
+    #[test]
+    fn cache_is_fresh_matching_hash_returns_true() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let analysis = make_test_analysis("src/lib.rs", "hash-abc");
+
+        cache.put(&analysis).unwrap();
+        let is_fresh = cache.is_fresh("test-project", "src/lib.rs", "hash-abc").unwrap();
+
+        assert!(is_fresh);
+    }
+
+    #[test]
+    fn cache_is_fresh_mismatched_hash_returns_false() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let analysis = make_test_analysis("src/lib.rs", "hash-abc");
+
+        cache.put(&analysis).unwrap();
+        let is_fresh = cache.is_fresh("test-project", "src/lib.rs", "hash-xyz").unwrap();
+
+        assert!(!is_fresh);
+    }
+
+    #[test]
+    fn cache_is_fresh_missing_file_returns_false() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let is_fresh = cache.is_fresh("test-project", "nonexistent.rs", "any-hash").unwrap();
+        assert!(!is_fresh);
+    }
+
+    #[test]
+    fn cache_existing_get_still_works_without_hash_check() {
+        let cache = FileAnalysisCache::in_memory().unwrap();
+        let analysis = make_test_analysis("src/lib.rs", "hash-abc");
+
+        cache.put(&analysis).unwrap();
+        // get() should return analysis regardless of hash (backward compat)
+        let retrieved = cache.get("test-project", "src/lib.rs").unwrap();
+        assert_eq!(Some(analysis), retrieved);
     }
 }

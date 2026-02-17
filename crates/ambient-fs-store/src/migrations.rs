@@ -136,6 +136,11 @@ fn create_tables_v1(conn: &Connection) -> SqliteResult<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_analysis_hash
+         ON file_analysis(project_id, content_hash)",
+        [],
+    )?;
 
     // projects: watched projects registry
     conn.execute(
@@ -205,6 +210,7 @@ mod tests {
         assert!(indexes.contains(&"idx_events_project_time".to_string()));
         assert!(indexes.contains(&"idx_events_source".to_string()));
         assert!(indexes.contains(&"idx_events_machine".to_string()));
+        assert!(indexes.contains(&"idx_analysis_hash".to_string()));
     }
 
     #[test]

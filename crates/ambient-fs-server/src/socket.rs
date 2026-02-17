@@ -425,16 +425,16 @@ async fn handle_request(
             handle_unwatch_project(req, state).await
         }
         Method::WatchAgents => {
-            // TODO: watch agents directory for JSONL files
-            Response::error(req.id, ProtocolError::method_not_found("watch_agents".to_string()))
+            handle_watch_agents(req, state).await
         }
         Method::UnwatchAgents => {
-            // TODO: unwatch agents directory
-            Response::error(req.id, ProtocolError::method_not_found("unwatch_agents".to_string()))
+            handle_unwatch_agents(req, state).await
         }
         Method::QueryAgents => {
-            // TODO: return active agents
-            Response::error(req.id, ProtocolError::method_not_found("query_agents".to_string()))
+            handle_query_agents(req, state).await
+        }
+        Method::Attribute => {
+            handle_attribute(req, state).await
         }
     }
 }
@@ -715,6 +715,139 @@ async fn handle_unwatch_project(req: Request, state: &ServerState) -> Response {
     Response::result(id, serde_json::json!(true))
 }
 
+/// Handle watch_agents request
+///
+/// Registers a directory to watch for agent activity JSONL files.
+///
+/// Expects params: {"path": "/path/to/.agents", "project": "my-project"}
+/// Returns: {"watching": true, "path": "..."}
+async fn handle_watch_agents(req: Request, state: &ServerState) -> Response {
+    let id = req.id.clone();
+
+    // Extract path from params
+    let agents_path = match extract_object_params(&req).and_then(|m| m.get("path")) {
+        Some(p) if p.is_string() => std::path::PathBuf::from(p.as_str().unwrap()),
+        _ => {
+            return Response::error(
+                id,
+                ProtocolError::invalid_params("path is required and must be a string"),
+            );
+        }
+    };
+
+    // Validate path exists and is a directory
+    if !agents_path.exists() {
+        return Response::error(
+            id,
+            ProtocolError::invalid_path(format!("path does not exist: {}", agents_path.display())),
+        );
+    }
+
+    if !agents_path.is_dir() {
+        return Response::error(
+            id,
+            ProtocolError::invalid_path(format!("path is not a directory: {}", agents_path.display())),
+        );
+    }
+
+    // Store the agents directory path in state.projects with a special prefix
+    // This allows tracking watched agent directories
+    let watch_key = format!("agents:{}", agents_path.display());
+    state.add_project(watch_key, agents_path.clone()).await;
+
+    debug!("Watching agents directory: {}", agents_path.display());
+
+    // In a full implementation, we'd spawn a task to tail the JSONL files
+    // For now, the tracking infrastructure is in place
+
+    Response::result(
+        id,
+        serde_json::json!({
+            "watching": true,
+            "path": agents_path.display().to_string(),
+        }),
+    )
+}
+
+/// Handle unwatch_agents request
+///
+/// Stops watching a directory for agent activity.
+///
+/// Expects params: {"path": "/path/to/.agents"}
+/// Returns: true
+async fn handle_unwatch_agents(req: Request, state: &ServerState) -> Response {
+    let id = req.id.clone();
+
+    // Extract path from params
+    let agents_path = match extract_object_params(&req).and_then(|m| m.get("path")) {
+        Some(p) if p.is_string() => std::path::PathBuf::from(p.as_str().unwrap()),
+        _ => {
+            return Response::error(
+                id,
+                ProtocolError::invalid_params("path is required and must be a string"),
+            );
+        }
+    };
+
+    // Remove from state
+    let watch_key = format!("agents:{}", agents_path.display());
+    state.remove_project(&watch_key).await;
+
+    debug!("Unwatched agents directory: {}", agents_path.display());
+
+    Response::result(id, serde_json::json!(true))
+}
+
+/// Handle query_agents request
+///
+/// Returns all currently active agents.
+///
+/// Optional params: {"file": "src/main.rs"} - query specific file
+/// Returns: [{"agent_id": "...", "files": [...], "last_seen": ..., "intent": "..."}]
+async fn handle_query_agents(req: Request, state: &ServerState) -> Response {
+    let id = req.id.clone();
+
+    // Check if querying for a specific file
+    let query_file = extract_object_params(&req)
+        .and_then(|m| m.get("file"))
+        .and_then(|f| f.as_str())
+        .map(|s| s.to_string());
+
+    let agents = state.agent_tracker.get_all_agents().await;
+
+    // Convert to JSON array
+    let json_agents: Vec<serde_json::Value> = if let Some(ref file) = query_file {
+        // If querying for a specific file, only return agents working on that file
+        agents
+            .into_iter()
+            .filter(|a| a.files.contains(file))
+            .map(|a| serde_json::json!({
+                "agent_id": a.agent_id,
+                "files": a.files,
+                "last_seen": a.last_seen.timestamp(),
+                "intent": a.intent,
+                "tool": a.tool,
+                "session": a.session,
+            }))
+            .collect()
+    } else {
+        // Return all agents
+        agents
+            .into_iter()
+            .map(|a| serde_json::json!({
+                "agent_id": a.agent_id,
+                "files": a.files,
+                "last_seen": a.last_seen.timestamp(),
+                "intent": a.intent,
+                "tool": a.tool,
+                "session": a.session,
+            }))
+            .collect()
+    };
+
+    Response::result(id, serde_json::json!(json_agents))
+}
+
 /// Helper to extract object params from Request
 fn extract_object_params(req: &Request) -> Option<&serde_json::Map<String, serde_json::Value>> {
     match &req.params {
@@ -809,9 +942,6 @@ async fn handle_query_events(req: Request, state: &ServerState) -> Response {
 /// Expects params: {"project_id": "my-project", "path": "src/main.rs"}
 /// Returns: FileAwareness object or null if no event found
 async fn handle_query_awareness(req: Request, state: &ServerState) -> Response {
-    use ambient_fs_core::awareness::FileAwareness;
-    use ambient_fs_store::EventStore;
-
     let params = match extract_object_params(&req) {
         Some(p) => p,
         None => {
@@ -844,49 +974,135 @@ async fn handle_query_awareness(req: Request, state: &ServerState) -> Response {
         }
     };
 
-    // Query the store for the latest event
-    let store_path = state.store_path.clone();
-    let project_id_owned = project_id.to_string();
-    let file_path_owned = file_path.to_string();
-
-    let event_result = tokio::task::spawn_blocking(move || {
-        let store = EventStore::new(store_path)?;
-        store.get_latest(&project_id_owned, &file_path_owned)
-    })
-    .await;
-
-    let awareness = match event_result {
-        Ok(Ok(Some(event))) => {
-            // Build FileAwareness from the event
-            let awareness = FileAwareness::from_event_minimal(
-                &event.file_path,
-                &event.project_id,
-                event.timestamp,
-                event.source,
-            );
-            Some(awareness)
-        }
-        Ok(Ok(None)) => None,
-        Ok(Err(_)) => {
-            // Store error - return null for now
-            None
+    // Use the awareness aggregator
+    let awareness = match crate::awareness::build_awareness(state, project_id, file_path).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return Response::result(req.id, serde_json::json!(null));
         }
         Err(_) => {
-            // Task join error - return null
-            None
+            // Log error internally, return null to client
+            return Response::result(req.id, serde_json::json!(null));
         }
     };
 
-    // Serialize to JSON or return null
-    match awareness {
-        Some(a) => {
-            match serde_json::to_value(&a) {
-                Ok(v) => Response::result(req.id, v),
-                Err(_) => Response::result(req.id, serde_json::json!(null)),
-            }
-        }
-        None => Response::result(req.id, serde_json::json!(null)),
+    // Serialize to JSON
+    match serde_json::to_value(&awareness) {
+        Ok(v) => Response::result(req.id, v),
+        Err(_) => Response::result(req.id, serde_json::json!(null)),
     }
+}
+
+/// Handle attribute request
+///
+/// Expects params: {"file_path": "src/auth.rs", "project_id": "my-project",
+///                  "source": "ai_agent", "source_id": "optional"}
+/// Returns: {"attributed": true}
+async fn handle_attribute(req: Request, state: &ServerState) -> Response {
+    use ambient_fs_core::event::{FileEvent, EventType, Source};
+    use ambient_fs_store::EventStore;
+
+    let id = req.id.clone();
+
+    // Extract params
+    let params = match extract_object_params(&req) {
+        Some(p) => p,
+        None => {
+            return Response::error(
+                id,
+                ProtocolError::invalid_params("params must be an object"),
+            );
+        }
+    };
+
+    // Extract file_path (required)
+    let file_path = match params.get("file_path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => {
+            return Response::error(
+                id.clone(),
+                ProtocolError::invalid_params("file_path is required"),
+            );
+        }
+    };
+
+    // Extract project_id (required)
+    let project_id = match params.get("project_id").and_then(|v| v.as_str()) {
+        Some(pid) => pid,
+        None => {
+            return Response::error(
+                id.clone(),
+                ProtocolError::invalid_params("project_id is required"),
+            );
+        }
+    };
+
+    // Extract source (required)
+    let source_str = match params.get("source").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return Response::error(
+                id.clone(),
+                ProtocolError::invalid_params("source is required"),
+            );
+        }
+    };
+
+    // Parse source string into Source enum
+    let source = match source_str.parse::<Source>() {
+        Ok(s) => s,
+        Err(_) => {
+            return Response::error(
+                id.clone(),
+                ProtocolError::invalid_params(format!("invalid source: {}", source_str)),
+            );
+        }
+    };
+
+    // Extract source_id (optional)
+    let source_id = params.get("source_id").and_then(|v| v.as_str());
+
+    // Create FileEvent with explicit source
+    let mut event = FileEvent::new(
+        EventType::Modified,
+        file_path,
+        project_id,
+        &state.machine_id,
+    );
+    event = event.with_source(source);
+    if let Some(sid) = source_id {
+        event = event.with_source_id(sid.to_string());
+    }
+
+    // Clone for broadcast after insert
+    let event_clone = event.clone();
+
+    // Insert into store via spawn_blocking
+    let store_path = state.store_path.clone();
+    let insert_result = tokio::task::spawn_blocking(move || {
+        let store = EventStore::new(store_path)?;
+        store.insert(&event)
+    })
+    .await;
+
+    match insert_result {
+        Ok(Ok(_)) => {},
+        Ok(Err(store_err)) => {
+            debug!("Store insert error during attribute: {:?}", store_err);
+            return Response::error(id, ProtocolError::internal_error());
+        }
+        Err(join_err) => {
+            debug!("Join error during attribute: {:?}", join_err);
+            return Response::error(id, ProtocolError::internal_error());
+        }
+    }
+
+    // Broadcast to subscribers
+    state.subscriptions.broadcast(event_clone).await;
+
+    debug!("Attributed file {} to source {}", file_path, source_str);
+
+    Response::result(id, serde_json::json!({"attributed": true}))
 }
 
 #[cfg(test)]

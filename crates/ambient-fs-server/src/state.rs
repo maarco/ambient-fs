@@ -1,7 +1,6 @@
 // Shared server state for socket connections
 // TDD: Tests FIRST, then implementation
 
-use chrono::Duration;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +23,8 @@ pub struct ServerState {
     pub watchers: Arc<RwLock<HashMap<String, Arc<Mutex<FsWatcher>>>>>,
     /// Machine ID for event attribution
     pub machine_id: String,
+    /// Agent activity tracker
+    pub agent_tracker: AgentTracker,
 }
 
 impl ServerState {
@@ -38,6 +39,7 @@ impl ServerState {
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_else(|| "unknown".to_string()),
+            agent_tracker: AgentTracker::with_default_timeout(),
         }
     }
 
@@ -49,6 +51,7 @@ impl ServerState {
             projects: Arc::new(RwLock::new(HashMap::new())),
             watchers: Arc::new(RwLock::new(HashMap::new())),
             machine_id,
+            agent_tracker: AgentTracker::with_default_timeout(),
         }
     }
 
@@ -103,6 +106,26 @@ impl ServerState {
     pub async fn remove_watcher(&self, project_id: &str) -> Option<Arc<Mutex<FsWatcher>>> {
         let mut watchers = self.watchers.write().await;
         watchers.remove(project_id)
+    }
+
+    /// Get the active agent for a specific file
+    pub async fn get_active_agent(&self, file_path: &str) -> Option<String> {
+        self.agent_tracker.get_active_agent(file_path).await
+    }
+
+    /// Update agent state from an activity line
+    pub async fn update_agent_activity(&self, activity: &crate::agents::AgentActivity) {
+        self.agent_tracker.update_from_activity(activity).await;
+    }
+
+    /// Get all active agents
+    pub async fn get_all_agents(&self) -> Vec<crate::agents::AgentState> {
+        self.agent_tracker.get_all_agents().await
+    }
+
+    /// Prune stale agents
+    pub async fn prune_stale_agents(&self) -> usize {
+        self.agent_tracker.prune_stale().await
     }
 }
 

@@ -94,6 +94,51 @@ impl DaemonServer {
         })
     }
 
+    /// Restore previously watched projects from store
+    ///
+    /// Reads projects from database and re-watches them if paths still exist.
+    /// Stale projects (deleted paths) are removed from the store.
+    async fn restore_projects(&self) -> Result<()> {
+        let store_path = self.store_path.clone();
+        let projects = tokio::task::spawn_blocking(move || {
+            let store = EventStore::new(store_path)?;
+            store.list_projects()
+        }).await??;
+
+        let mut watcher = self.watcher.lock().await;
+        let store_path_for_removal = self.store_path.clone();
+
+        for (project_id, path) in projects {
+            if path.exists() {
+                // Path still exists, resume watching
+                if let Err(e) = watcher.watch(path.clone()) {
+                    tracing::warn!("failed to restore watch for {} ({}): {}", project_id, path.display(), e);
+                    // Remove failed watch from store
+                    let pid = project_id.clone();
+                    let sp = store_path_for_removal.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let store = EventStore::new(sp)?;
+                        store.remove_project(&pid)
+                    }).await.ok();
+                } else {
+                    self.state.add_project(project_id.clone(), path).await;
+                    tracing::info!("restored watch: {} -> {}", project_id, path.display());
+                }
+            } else {
+                // Path deleted, remove stale project
+                tracing::warn!("stale project removed: {} -> {}", project_id, path.display());
+                let pid = project_id.clone();
+                let sp = store_path_for_removal.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = EventStore::new(sp)?;
+                    store.remove_project(&pid)
+                }).await.ok();
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start the daemon server
     ///
     /// This blocks until shutdown is requested.
@@ -104,6 +149,9 @@ impl DaemonServer {
         }
         *running = true;
         drop(running);
+
+        // Restore previously watched projects
+        self.restore_projects().await?;
 
         // Bind socket server and set state
         {
