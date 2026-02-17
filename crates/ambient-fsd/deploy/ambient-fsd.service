@@ -1,0 +1,13 @@
+[Unit]
+Description=Ambient Filesystem Awareness Daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={BINARY} start --foreground
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

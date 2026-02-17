@@ -328,10 +328,10 @@ async fn cmd_prune(retention_days: i64) -> Result<(), anyhow::Error> {
 
 /// Service file templates embedded at compile time
 #[cfg(target_os = "macos")]
-const LAUNCHD_PLIST_TEMPLATE: &str = include_str!("../../../deploy/com.ambient-fs.daemon.plist");
+const LAUNCHD_PLIST_TEMPLATE: &str = include_str!("../deploy/com.ambient-fs.daemon.plist");
 
 #[cfg(target_os = "linux")]
-const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../../../deploy/ambient-fsd.service");
+const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../deploy/ambient-fsd.service");
 
 fn cmd_install_service() -> Result<(), anyhow::Error> {
     let binary = std::env::current_exe()?;
