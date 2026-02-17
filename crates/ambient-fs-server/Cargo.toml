@@ -1,0 +1,27 @@
+[package]
+name = "ambient-fs-server"
+description = "Unix socket and gRPC server for ambient-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ambient-fs-core = { path = "../ambient-fs-core" }
+ambient-fs-store = { path = "../ambient-fs-store" }
+ambient-fs-watcher = { path = "../ambient-fs-watcher" }
+ambient-fs-analyzer = { path = "../ambient-fs-analyzer" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+hostname = "0.4"
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros"] }
+pretty_assertions = "1"

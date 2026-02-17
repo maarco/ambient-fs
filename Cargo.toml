@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ambient-fs-core",
+    "crates/ambient-fs-store",
+    "crates/ambient-fs-watcher",
+    "crates/ambient-fs-analyzer",
+    "crates/ambient-fs-server",
+    "crates/ambient-fsd",
+    "crates/ambient-fs-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Kollabor Team"]
+repository = "https://github.com/kollabor/ambient-fs"
+
+[workspace.dependencies]
+# Shared dependencies pinned at workspace level
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+rusqlite = { version = "0.38", features = ["bundled"] }
+notify = "8"
+clap = { version = "4", features = ["derive"] }
+toml = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
