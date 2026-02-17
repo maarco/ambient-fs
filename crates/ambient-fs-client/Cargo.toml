@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-ambient-fs-core = { path = "../ambient-fs-core", version = "0.1.0" }
+ambient-fs-core = { path = "../ambient-fs-core", version = "0.1.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
