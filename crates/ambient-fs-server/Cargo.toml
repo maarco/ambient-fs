@@ -5,12 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-ambient-fs-core = { path = "../ambient-fs-core" }
-ambient-fs-store = { path = "../ambient-fs-store" }
-ambient-fs-watcher = { path = "../ambient-fs-watcher" }
-ambient-fs-analyzer = { path = "../ambient-fs-analyzer" }
+ambient-fs-core = { path = "../ambient-fs-core", version = "0.1.0" }
+ambient-fs-store = { path = "../ambient-fs-store", version = "0.1.0" }
+ambient-fs-watcher = { path = "../ambient-fs-watcher", version = "0.1.0" }
+ambient-fs-analyzer = { path = "../ambient-fs-analyzer", version = "0.1.0" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

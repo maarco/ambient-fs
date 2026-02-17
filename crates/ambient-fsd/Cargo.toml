@@ -5,17 +5,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "ambient-fsd"
 path = "src/main.rs"
 
 [dependencies]
-ambient-fs-core = { path = "../ambient-fs-core" }
-ambient-fs-store = { path = "../ambient-fs-store" }
-ambient-fs-watcher = { path = "../ambient-fs-watcher" }
-ambient-fs-analyzer = { path = "../ambient-fs-analyzer" }
-ambient-fs-server = { path = "../ambient-fs-server" }
+ambient-fs-core = { path = "../ambient-fs-core", version = "0.1.0" }
+ambient-fs-store = { path = "../ambient-fs-store", version = "0.1.0" }
+ambient-fs-watcher = { path = "../ambient-fs-watcher", version = "0.1.0" }
+ambient-fs-analyzer = { path = "../ambient-fs-analyzer", version = "0.1.0" }
+ambient-fs-server = { path = "../ambient-fs-server", version = "0.1.0" }
 tokio = { workspace = true }
 clap = { workspace = true }
 toml = { workspace = true }
