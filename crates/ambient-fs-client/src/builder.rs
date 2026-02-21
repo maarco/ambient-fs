@@ -1,9 +1,18 @@
 // Builder API for AmbientFsClient
 
-use crate::{client::AmbientFsClient, ClientError, DEFAULT_SOCKET_PATH, Result};
+use crate::{client::AmbientFsClient, ClientError, Result};
 use std::path::PathBuf;
 use std::time::Duration;
+
+#[cfg(unix)]
+use crate::DEFAULT_SOCKET_PATH;
+#[cfg(unix)]
 use tokio::net::UnixStream;
+
+#[cfg(windows)]
+use crate::DEFAULT_ADDR;
+#[cfg(windows)]
+use tokio::net::TcpStream;
 
 /// Default notification channel buffer size
 const DEFAULT_NOTIFICATION_BUFFER: usize = 256;
@@ -25,8 +34,13 @@ impl Default for AmbientFsClientBuilder {
 impl AmbientFsClientBuilder {
     /// Create a new builder with default settings
     pub fn new() -> Self {
+        #[cfg(unix)]
+        let socket_path = PathBuf::from(DEFAULT_SOCKET_PATH);
+        #[cfg(windows)]
+        let socket_path = PathBuf::from(DEFAULT_ADDR);
+
         Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
+            socket_path,
             connect_timeout: None,
             notification_buffer_size: DEFAULT_NOTIFICATION_BUFFER,
         }
@@ -54,9 +68,17 @@ impl AmbientFsClientBuilder {
         self
     }
 
-    /// Build and connect the client
+    /// Build and connect the client.
+    ///
+    /// On Unix, connects via Unix socket. On Windows, connects via TCP.
     pub async fn build(self) -> Result<AmbientFsClient> {
+        #[cfg(unix)]
         let connect_fut = UnixStream::connect(&self.socket_path);
+        #[cfg(windows)]
+        let addr = self.socket_path.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let connect_fut = TcpStream::connect(&*addr);
+
         let stream = if let Some(timeout) = self.connect_timeout {
             tokio::time::timeout(timeout, connect_fut)
                 .await

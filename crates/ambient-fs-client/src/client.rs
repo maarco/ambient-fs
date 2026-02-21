@@ -7,13 +7,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-/// Default socket path for ambient-fsd
+// Platform-specific stream types: Unix socket on unix, TCP on windows.
+// Both OwnedWriteHalf variants implement AsyncWrite, so the rest of the
+// code is identical across platforms.
+#[cfg(unix)]
+use tokio::net::unix::OwnedWriteHalf;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+#[cfg(windows)]
+use tokio::net::tcp::OwnedWriteHalf;
+#[cfg(windows)]
+use tokio::net::TcpStream;
+
+/// Default socket path for ambient-fsd (Unix)
+#[cfg(unix)]
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/ambient-fs.sock";
+
+/// Default TCP address for ambient-fsd (Windows)
+#[cfg(windows)]
+pub const DEFAULT_ADDR: &str = "127.0.0.1:9851";
 
 /// Default notification channel buffer size
 const DEFAULT_NOTIFICATION_BUFFER: usize = 256;
@@ -177,26 +193,66 @@ pub enum ClientError {
 pub type Result<T> = std::result::Result<T, ClientError>;
 
 impl AmbientFsClient {
-    /// Connect to the daemon at the default socket path (/tmp/ambient-fs.sock)
+    /// Connect to the daemon at the default endpoint.
+    ///
+    /// On Unix, connects to `/tmp/ambient-fs.sock` (Unix socket).
+    /// On Windows, connects to `127.0.0.1:9851` (TCP).
     pub async fn connect_local() -> Result<Self> {
-        Self::connect(DEFAULT_SOCKET_PATH).await
+        #[cfg(unix)]
+        {
+            Self::connect(DEFAULT_SOCKET_PATH).await
+        }
+        #[cfg(windows)]
+        {
+            Self::connect(DEFAULT_ADDR).await
+        }
     }
 
-    /// Connect to the daemon at the specified socket path
-    pub async fn connect(socket_path: impl Into<PathBuf>) -> Result<Self> {
-        let socket_path = socket_path.into();
-        let stream = UnixStream::connect(&socket_path).await?;
-        Ok(Self::from_stream(stream, socket_path, DEFAULT_NOTIFICATION_BUFFER))
+    /// Connect to the daemon at the specified endpoint.
+    ///
+    /// On Unix, this is a socket path (e.g. `/tmp/ambient-fs.sock`).
+    /// On Windows, this is a TCP address (e.g. `127.0.0.1:9851`).
+    pub async fn connect(endpoint: impl Into<PathBuf>) -> Result<Self> {
+        let endpoint = endpoint.into();
+        #[cfg(unix)]
+        let stream = UnixStream::connect(&endpoint).await?;
+        #[cfg(windows)]
+        let stream = {
+            let addr = endpoint.to_string_lossy().into_owned();
+            TcpStream::connect(&addr).await?
+        };
+        Ok(Self::from_stream(stream, endpoint, DEFAULT_NOTIFICATION_BUFFER))
     }
 
-    /// Build a client from a pre-connected stream.
-    /// Splits the stream, spawns the background reader task, sets up channels.
+    /// Build a client from a pre-connected UnixStream (unix only).
+    #[cfg(unix)]
     pub(crate) fn from_stream(
         stream: UnixStream,
         socket_path: PathBuf,
         notification_buffer: usize,
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
+        Self::from_halves(read_half, write_half, socket_path, notification_buffer)
+    }
+
+    /// Build a client from a pre-connected TcpStream (windows only).
+    #[cfg(windows)]
+    pub(crate) fn from_stream(
+        stream: TcpStream,
+        socket_path: PathBuf,
+        notification_buffer: usize,
+    ) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        Self::from_halves(read_half, write_half, socket_path, notification_buffer)
+    }
+
+    /// Internal: wire up the reader task and channels from pre-split halves.
+    fn from_halves<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+        read_half: R,
+        write_half: OwnedWriteHalf,
+        socket_path: PathBuf,
+        notification_buffer: usize,
+    ) -> Self {
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<JsonValue>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (notification_tx, notification_rx) = mpsc::channel(notification_buffer);
