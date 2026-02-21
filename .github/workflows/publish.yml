@@ -1,0 +1,33 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates (dependency order)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p ambient-fs-core || true
+          sleep 15
+          cargo publish -p ambient-fs-store || true
+          cargo publish -p ambient-fs-watcher || true
+          cargo publish -p ambient-fs-analyzer || true
+          cargo publish -p ambient-fs-client || true
+          sleep 15
+          cargo publish -p ambient-fs-server || true
+          sleep 15
+          cargo publish -p ambient-fsd || true
