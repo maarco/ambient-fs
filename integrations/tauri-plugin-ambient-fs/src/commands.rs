@@ -108,6 +108,24 @@ pub async fn query_agents(
     client.query_agents().await.map_err(|e| e.to_string())
 }
 
+/// subscribe to notifications for a project
+#[tauri::command]
+pub async fn subscribe(
+    state: State<'_, PluginState>,
+    project_id: String,
+) -> Result<(), String> {
+    state.subscribe(&project_id).await.map_err(|e| e.to_string())
+}
+
+/// unsubscribe from notifications for a project
+#[tauri::command]
+pub async fn unsubscribe(
+    state: State<'_, PluginState>,
+    project_id: String,
+) -> Result<(), String> {
+    state.unsubscribe(&project_id).await.map_err(|e| e.to_string())
+}
+
 /// get daemon connection status
 #[tauri::command]
 pub async fn get_status(

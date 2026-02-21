@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "ambient-fs-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ambient-fs-core",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ambient-fs-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3336,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-ambient-fs"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ambient-fs-client",
  "ambient-fs-core",

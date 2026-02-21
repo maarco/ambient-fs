@@ -34,6 +34,8 @@ pub fn init() -> tauri::plugin::TauriPlugin<Wry> {
             commands::query_tree,
             commands::attribute,
             commands::query_agents,
+            commands::subscribe,
+            commands::unsubscribe,
             commands::get_status,
         ])
         .setup(|app, _api| {

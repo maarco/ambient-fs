@@ -3,12 +3,17 @@
 use crate::{client::AmbientFsClient, ClientError, DEFAULT_SOCKET_PATH, Result};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::net::UnixStream;
+
+/// Default notification channel buffer size
+const DEFAULT_NOTIFICATION_BUFFER: usize = 256;
 
 /// Fluent builder for constructing AmbientFsClient
 #[derive(Debug, Clone)]
 pub struct AmbientFsClientBuilder {
     socket_path: PathBuf,
     connect_timeout: Option<Duration>,
+    notification_buffer_size: usize,
 }
 
 impl Default for AmbientFsClientBuilder {
@@ -23,6 +28,7 @@ impl AmbientFsClientBuilder {
         Self {
             socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
             connect_timeout: None,
+            notification_buffer_size: DEFAULT_NOTIFICATION_BUFFER,
         }
     }
 
@@ -38,18 +44,31 @@ impl AmbientFsClientBuilder {
         self
     }
 
+    /// Set the notification channel buffer size (default: 256).
+    ///
+    /// Controls how many server-pushed notifications can be buffered before
+    /// new ones are dropped. Increase if your application processes
+    /// notifications slower than they arrive.
+    pub fn notification_buffer_size(mut self, size: usize) -> Self {
+        self.notification_buffer_size = size;
+        self
+    }
+
     /// Build and connect the client
     pub async fn build(self) -> Result<AmbientFsClient> {
-        if let Some(timeout) = self.connect_timeout {
-            tokio::time::timeout(
-                timeout,
-                AmbientFsClient::connect(self.socket_path),
-            )
-            .await
-            .map_err(|_| ClientError::DaemonError("connection timeout".to_string()))?
+        let connect_fut = UnixStream::connect(&self.socket_path);
+        let stream = if let Some(timeout) = self.connect_timeout {
+            tokio::time::timeout(timeout, connect_fut)
+                .await
+                .map_err(|_| ClientError::DaemonError("connection timeout".to_string()))?
         } else {
-            Ok(AmbientFsClient::connect(self.socket_path).await?)
-        }
+            connect_fut.await
+        }?;
+        Ok(AmbientFsClient::from_stream(
+            stream,
+            self.socket_path,
+            self.notification_buffer_size,
+        ))
     }
 }
 
@@ -70,6 +89,12 @@ mod tests {
     }
 
     #[test]
+    fn builder_default_notification_buffer() {
+        let builder = AmbientFsClientBuilder::new();
+        assert_eq!(builder.notification_buffer_size, 256);
+    }
+
+    #[test]
     fn builder_socket_path_override() {
         let builder = AmbientFsClientBuilder::new()
             .socket_path("/custom/path.sock");
@@ -84,12 +109,21 @@ mod tests {
     }
 
     #[test]
+    fn builder_notification_buffer_size_override() {
+        let builder = AmbientFsClientBuilder::new()
+            .notification_buffer_size(1024);
+        assert_eq!(builder.notification_buffer_size, 1024);
+    }
+
+    #[test]
     fn builder_chaining_works() {
         let builder = AmbientFsClientBuilder::new()
             .socket_path("/tmp/test.sock")
-            .connect_timeout(Duration::from_secs(5));
+            .connect_timeout(Duration::from_secs(5))
+            .notification_buffer_size(512);
         assert_eq!(builder.socket_path, PathBuf::from("/tmp/test.sock"));
         assert_eq!(builder.connect_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(builder.notification_buffer_size, 512);
     }
 
     #[test]
@@ -97,6 +131,7 @@ mod tests {
         let builder = AmbientFsClientBuilder::default();
         assert_eq!(builder.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
         assert!(builder.connect_timeout.is_none());
+        assert_eq!(builder.notification_buffer_size, 256);
     }
 
     #[test]

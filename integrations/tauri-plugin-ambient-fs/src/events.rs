@@ -7,7 +7,6 @@ use ambient_fs_core::FileEvent;
 /// event names emitted to frontend
 pub const EVT_EVENT: &str = "ambient-fs://event";
 pub const EVT_AWARENESS: &str = "ambient-fs://awareness-changed";
-pub const EVT_ANALYSIS: &str = "ambient-fs://analysis-complete";
 pub const EVT_CONNECTED: &str = "ambient-fs://connected";
 
 /// emit connection status change to frontend
@@ -36,21 +35,6 @@ pub fn emit_awareness_changed(
     let _ = app.emit(EVT_AWARENESS, payload);
 }
 
-/// emit analysis complete event to frontend
-pub fn emit_analysis_complete(
-    app: &AppHandle,
-    project_id: String,
-    file_path: String,
-    analysis: ambient_fs_core::analysis::FileAnalysis,
-) {
-    let payload = json!({
-        "project_id": project_id,
-        "file_path": file_path,
-        "analysis": analysis,
-    });
-    let _ = app.emit(EVT_ANALYSIS, payload);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,7 +43,6 @@ mod tests {
     fn event_names_are_defined() {
         assert_eq!(EVT_EVENT, "ambient-fs://event");
         assert_eq!(EVT_AWARENESS, "ambient-fs://awareness-changed");
-        assert_eq!(EVT_ANALYSIS, "ambient-fs://analysis-complete");
         assert_eq!(EVT_CONNECTED, "ambient-fs://connected");
     }
 
