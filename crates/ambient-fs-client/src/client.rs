@@ -524,18 +524,268 @@ mod tests {
     use super::*;
     use ambient_fs_core::{EventType, Source};
 
-    /// Create a client connected to a mock server via UnixStream::pair()
-    fn mock_client() -> (AmbientFsClient, UnixStream) {
-        let (client_stream, server_stream) = UnixStream::pair().unwrap();
-        let client = AmbientFsClient::from_stream(
-            client_stream,
-            PathBuf::from("/tmp/test.sock"),
-            256,
-        );
-        (client, server_stream)
+    // ===== unix-only tests (use UnixStream::pair for mock) =====
+
+    #[cfg(unix)]
+    mod unix_stream_tests {
+        use super::*;
+
+        fn mock_client() -> (AmbientFsClient, UnixStream) {
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let client = AmbientFsClient::from_stream(
+                client_stream,
+                PathBuf::from("/tmp/test.sock"),
+                256,
+            );
+            (client, server_stream)
+        }
+
+        #[tokio::test]
+        async fn reader_routes_response_by_id() {
+            let (client, mut server) = mock_client();
+
+            let (tx10, rx10) = oneshot::channel();
+            let (tx20, rx20) = oneshot::channel();
+            {
+                let mut map = client.pending.lock().await;
+                map.insert(10, tx10);
+                map.insert(20, tx20);
+            }
+
+            let r20 = format!("{}\n", json!({"jsonrpc":"2.0","result":"twenty","id":20}));
+            let r10 = format!("{}\n", json!({"jsonrpc":"2.0","result":"ten","id":10}));
+            server.write_all(r20.as_bytes()).await.unwrap();
+            server.write_all(r10.as_bytes()).await.unwrap();
+
+            let result20 = rx20.await.unwrap().unwrap();
+            let result10 = rx10.await.unwrap().unwrap();
+            assert_eq!(result20, json!("twenty"));
+            assert_eq!(result10, json!("ten"));
+        }
+
+        #[tokio::test]
+        async fn reader_routes_error_response() {
+            let (client, mut server) = mock_client();
+
+            let (tx, rx) = oneshot::channel();
+            {
+                client.pending.lock().await.insert(1, tx);
+            }
+
+            let resp = format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"not found"},"id":1})
+            );
+            server.write_all(resp.as_bytes()).await.unwrap();
+
+            let result = rx.await.unwrap();
+            assert!(matches!(result, Err(ClientError::DaemonError(msg)) if msg == "not found"));
+        }
+
+        #[tokio::test]
+        async fn reader_routes_notification_to_channel() {
+            let (mut client, mut server) = mock_client();
+            let mut rx = client.take_notification_stream().unwrap();
+
+            let notif = format!(
+                "{}\n",
+                json!({"jsonrpc":"2.0","method":"event","params":{"path":"src/lib.rs"}})
+            );
+            server.write_all(notif.as_bytes()).await.unwrap();
+
+            let received = rx.recv().await.unwrap();
+            assert_eq!(received.method, "event");
+            assert_eq!(received.params["path"], "src/lib.rs");
+        }
+
+        #[tokio::test]
+        async fn take_notification_stream_returns_none_on_second_call() {
+            let (mut client, _server) = mock_client();
+            assert!(client.take_notification_stream().is_some());
+            assert!(client.take_notification_stream().is_none());
+        }
+
+        #[tokio::test]
+        async fn send_request_receives_response() {
+            let (mut client, server) = mock_client();
+
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = server.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: JsonValue = serde_json::from_str(&line).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                assert_eq!(req["method"], "watch");
+
+                let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
+                write_half.write_all(resp.as_bytes()).await.unwrap();
+            });
+
+            client.watch("/test/path").await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn send_request_receives_error_response() {
+            let (mut client, server) = mock_client();
+
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = server.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: JsonValue = serde_json::from_str(&line).unwrap();
+                let id = req["id"].as_u64().unwrap();
+
+                let resp = format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"project not found"},"id":id})
+                );
+                write_half.write_all(resp.as_bytes()).await.unwrap();
+            });
+
+            let result = client.watch_project("/nonexistent").await;
+            assert!(matches!(result, Err(ClientError::DaemonError(msg)) if msg == "project not found"));
+        }
+
+        #[tokio::test]
+        async fn connection_closed_fails_pending_requests() {
+            let (mut client, server) = mock_client();
+            drop(server);
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let result = client.watch("/test").await;
+            assert!(matches!(
+                result,
+                Err(ClientError::ConnectionClosed) | Err(ClientError::Io(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn notification_channel_closed_after_drop() {
+            let (mut client, mut server) = mock_client();
+            let mut rx = client.take_notification_stream().unwrap();
+
+            let notif = format!("{}\n", json!({"jsonrpc":"2.0","method":"ping","params":{}}));
+            server.write_all(notif.as_bytes()).await.unwrap();
+            let _ = rx.recv().await.unwrap();
+
+            drop(client);
+            drop(server);
+
+            assert!(rx.recv().await.is_none());
+        }
+
+        #[tokio::test]
+        async fn request_ids_increment() {
+            let (mut client, server) = mock_client();
+
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = server.into_split();
+                let mut reader = BufReader::new(read_half);
+                for _ in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let req: JsonValue = serde_json::from_str(&line).unwrap();
+                    let id = req["id"].as_u64().unwrap();
+                    let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
+                    write_half.write_all(resp.as_bytes()).await.unwrap();
+                }
+            });
+
+            client.watch("/path1").await.unwrap();
+            client.watch("/path2").await.unwrap();
+            assert_eq!(client.next_id.load(Ordering::Relaxed), 3);
+        }
+
+        #[tokio::test]
+        async fn client_stores_socket_path() {
+            let (client, _server) = mock_client();
+            assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
+        }
+
+        #[tokio::test]
+        async fn is_connected_reflects_reader_state() {
+            let (client, server) = mock_client();
+            assert!(client.is_connected());
+
+            drop(server);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!client.is_connected());
+        }
+
+        #[tokio::test]
+        async fn interleaved_notifications_and_responses() {
+            let (mut client, server) = mock_client();
+            let mut rx = client.take_notification_stream().unwrap();
+
+            tokio::spawn(async move {
+                let (read_half, mut write_half) = server.into_split();
+                let mut reader = BufReader::new(read_half);
+
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let req: JsonValue = serde_json::from_str(&line).unwrap();
+                let id = req["id"].as_u64().unwrap();
+
+                let notif = format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","method":"event","params":{"type":"created"}})
+                );
+                write_half.write_all(notif.as_bytes()).await.unwrap();
+
+                let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
+                write_half.write_all(resp.as_bytes()).await.unwrap();
+            });
+
+            client.watch("/test").await.unwrap();
+
+            let notif = rx.recv().await.unwrap();
+            assert_eq!(notif.method, "event");
+            assert_eq!(notif.params["type"], "created");
+        }
+
+        #[tokio::test]
+        async fn recv_notification_returns_typed() {
+            let (mut client, mut server) = mock_client();
+
+            let notif = format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "analysis_complete",
+                    "params": {
+                        "project_id": "proj-1",
+                        "file_path": "src/main.rs",
+                        "line_count": 42,
+                        "todo_count": 3
+                    }
+                })
+            );
+            server.write_all(notif.as_bytes()).await.unwrap();
+
+            let typed = client.recv_notification().await.unwrap().unwrap();
+            match typed {
+                Notification::AnalysisComplete { params } => {
+                    assert_eq!(params.project_id, "proj-1");
+                    assert_eq!(params.line_count, 42);
+                }
+                _ => panic!("expected AnalysisComplete"),
+            }
+        }
+
+        #[tokio::test]
+        async fn recv_notification_fails_after_take() {
+            let (mut client, _server) = mock_client();
+            let _rx = client.take_notification_stream().unwrap();
+
+            let result = client.recv_notification().await;
+            assert!(matches!(result, Err(ClientError::NotConnected)));
+        }
     }
 
-    // ===== notification / routing tests =====
+    // ===== platform-independent serialization/parsing tests =====
 
     #[tokio::test]
     async fn notification_serde_roundtrip() {
@@ -555,256 +805,6 @@ mod tests {
         assert_eq!(notif.method, "ping");
         assert_eq!(notif.params, JsonValue::Null);
     }
-
-    #[tokio::test]
-    async fn reader_routes_response_by_id() {
-        let (client, mut server) = mock_client();
-
-        let (tx10, rx10) = oneshot::channel();
-        let (tx20, rx20) = oneshot::channel();
-        {
-            let mut map = client.pending.lock().await;
-            map.insert(10, tx10);
-            map.insert(20, tx20);
-        }
-
-        // Send responses out of order: 20 first, then 10
-        let r20 = format!("{}\n", json!({"jsonrpc":"2.0","result":"twenty","id":20}));
-        let r10 = format!("{}\n", json!({"jsonrpc":"2.0","result":"ten","id":10}));
-        server.write_all(r20.as_bytes()).await.unwrap();
-        server.write_all(r10.as_bytes()).await.unwrap();
-
-        let result20 = rx20.await.unwrap().unwrap();
-        let result10 = rx10.await.unwrap().unwrap();
-        assert_eq!(result20, json!("twenty"));
-        assert_eq!(result10, json!("ten"));
-    }
-
-    #[tokio::test]
-    async fn reader_routes_error_response() {
-        let (client, mut server) = mock_client();
-
-        let (tx, rx) = oneshot::channel();
-        {
-            client.pending.lock().await.insert(1, tx);
-        }
-
-        let resp = format!(
-            "{}\n",
-            json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"not found"},"id":1})
-        );
-        server.write_all(resp.as_bytes()).await.unwrap();
-
-        let result = rx.await.unwrap();
-        assert!(matches!(result, Err(ClientError::DaemonError(msg)) if msg == "not found"));
-    }
-
-    #[tokio::test]
-    async fn reader_routes_notification_to_channel() {
-        let (mut client, mut server) = mock_client();
-        let mut rx = client.take_notification_stream().unwrap();
-
-        let notif = format!(
-            "{}\n",
-            json!({"jsonrpc":"2.0","method":"event","params":{"path":"src/lib.rs"}})
-        );
-        server.write_all(notif.as_bytes()).await.unwrap();
-
-        let received = rx.recv().await.unwrap();
-        assert_eq!(received.method, "event");
-        assert_eq!(received.params["path"], "src/lib.rs");
-    }
-
-    #[tokio::test]
-    async fn take_notification_stream_returns_none_on_second_call() {
-        let (mut client, _server) = mock_client();
-        assert!(client.take_notification_stream().is_some());
-        assert!(client.take_notification_stream().is_none());
-    }
-
-    #[tokio::test]
-    async fn send_request_receives_response() {
-        let (mut client, server) = mock_client();
-
-        tokio::spawn(async move {
-            let (read_half, mut write_half) = server.into_split();
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            let req: JsonValue = serde_json::from_str(&line).unwrap();
-            let id = req["id"].as_u64().unwrap();
-            assert_eq!(req["method"], "watch");
-
-            let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
-            write_half.write_all(resp.as_bytes()).await.unwrap();
-        });
-
-        client.watch("/test/path").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn send_request_receives_error_response() {
-        let (mut client, server) = mock_client();
-
-        tokio::spawn(async move {
-            let (read_half, mut write_half) = server.into_split();
-            let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            let req: JsonValue = serde_json::from_str(&line).unwrap();
-            let id = req["id"].as_u64().unwrap();
-
-            let resp = format!(
-                "{}\n",
-                json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"project not found"},"id":id})
-            );
-            write_half.write_all(resp.as_bytes()).await.unwrap();
-        });
-
-        let result = client.watch_project("/nonexistent").await;
-        assert!(matches!(result, Err(ClientError::DaemonError(msg)) if msg == "project not found"));
-    }
-
-    #[tokio::test]
-    async fn connection_closed_fails_pending_requests() {
-        let (mut client, server) = mock_client();
-        drop(server);
-
-        // Give reader task time to detect EOF
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let result = client.watch("/test").await;
-        assert!(matches!(
-            result,
-            Err(ClientError::ConnectionClosed) | Err(ClientError::Io(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn notification_channel_closed_after_drop() {
-        let (mut client, mut server) = mock_client();
-        let mut rx = client.take_notification_stream().unwrap();
-
-        let notif = format!("{}\n", json!({"jsonrpc":"2.0","method":"ping","params":{}}));
-        server.write_all(notif.as_bytes()).await.unwrap();
-        let _ = rx.recv().await.unwrap();
-
-        drop(client);
-        drop(server);
-
-        assert!(rx.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn request_ids_increment() {
-        let (mut client, server) = mock_client();
-
-        tokio::spawn(async move {
-            let (read_half, mut write_half) = server.into_split();
-            let mut reader = BufReader::new(read_half);
-            for _ in 0..2 {
-                let mut line = String::new();
-                reader.read_line(&mut line).await.unwrap();
-                let req: JsonValue = serde_json::from_str(&line).unwrap();
-                let id = req["id"].as_u64().unwrap();
-                let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
-                write_half.write_all(resp.as_bytes()).await.unwrap();
-            }
-        });
-
-        client.watch("/path1").await.unwrap();
-        client.watch("/path2").await.unwrap();
-        assert_eq!(client.next_id.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn client_stores_socket_path() {
-        let (client, _server) = mock_client();
-        assert_eq!(client.socket_path, PathBuf::from("/tmp/test.sock"));
-    }
-
-    #[tokio::test]
-    async fn is_connected_reflects_reader_state() {
-        let (client, server) = mock_client();
-        assert!(client.is_connected());
-
-        drop(server);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!client.is_connected());
-    }
-
-    #[tokio::test]
-    async fn interleaved_notifications_and_responses() {
-        let (mut client, server) = mock_client();
-        let mut rx = client.take_notification_stream().unwrap();
-
-        tokio::spawn(async move {
-            let (read_half, mut write_half) = server.into_split();
-            let mut reader = BufReader::new(read_half);
-
-            let mut line = String::new();
-            reader.read_line(&mut line).await.unwrap();
-            let req: JsonValue = serde_json::from_str(&line).unwrap();
-            let id = req["id"].as_u64().unwrap();
-
-            // Send notification before response
-            let notif = format!(
-                "{}\n",
-                json!({"jsonrpc":"2.0","method":"event","params":{"type":"created"}})
-            );
-            write_half.write_all(notif.as_bytes()).await.unwrap();
-
-            // Then the response
-            let resp = format!("{}\n", json!({"jsonrpc":"2.0","result":"ok","id":id}));
-            write_half.write_all(resp.as_bytes()).await.unwrap();
-        });
-
-        client.watch("/test").await.unwrap();
-
-        let notif = rx.recv().await.unwrap();
-        assert_eq!(notif.method, "event");
-        assert_eq!(notif.params["type"], "created");
-    }
-
-    #[tokio::test]
-    async fn recv_notification_returns_typed() {
-        let (mut client, mut server) = mock_client();
-
-        let notif = format!(
-            "{}\n",
-            json!({
-                "jsonrpc": "2.0",
-                "method": "analysis_complete",
-                "params": {
-                    "project_id": "proj-1",
-                    "file_path": "src/main.rs",
-                    "line_count": 42,
-                    "todo_count": 3
-                }
-            })
-        );
-        server.write_all(notif.as_bytes()).await.unwrap();
-
-        let typed = client.recv_notification().await.unwrap().unwrap();
-        match typed {
-            Notification::AnalysisComplete { params } => {
-                assert_eq!(params.project_id, "proj-1");
-                assert_eq!(params.line_count, 42);
-            }
-            _ => panic!("expected AnalysisComplete"),
-        }
-    }
-
-    #[tokio::test]
-    async fn recv_notification_fails_after_take() {
-        let (mut client, _server) = mock_client();
-        let _rx = client.take_notification_stream().unwrap();
-
-        let result = client.recv_notification().await;
-        assert!(matches!(result, Err(ClientError::NotConnected)));
-    }
-
-    // ===== preserved serialization/parsing tests =====
 
     #[tokio::test]
     async fn events_with_filter_sends_params() {

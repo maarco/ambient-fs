@@ -99,9 +99,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builder_default_has_correct_socket_path() {
+    fn builder_default_has_correct_endpoint() {
         let builder = AmbientFsClientBuilder::new();
+        #[cfg(unix)]
         assert_eq!(builder.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
+        #[cfg(windows)]
+        assert_eq!(builder.socket_path, PathBuf::from(DEFAULT_ADDR));
     }
 
     #[test]
@@ -151,7 +154,10 @@ mod tests {
     #[test]
     fn builder_default_trait() {
         let builder = AmbientFsClientBuilder::default();
+        #[cfg(unix)]
         assert_eq!(builder.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
+        #[cfg(windows)]
+        assert_eq!(builder.socket_path, PathBuf::from(DEFAULT_ADDR));
         assert!(builder.connect_timeout.is_none());
         assert_eq!(builder.notification_buffer_size, 256);
     }
